@@ -16,13 +16,14 @@ The output fields are `risk_level`, `risk_reasoning`, `architectural_impact`, `r
 3. **LLM only where judgment is needed.** Facts are computed in code, and the LLM does the judging.
 4. **Safe defaults.** When a decision is uncertain, the system takes the more thorough option.
 5. **Always produce an honest output.** Any valid input produces an output that matches the schema. When a stage fails, the review is marked degraded, and the trace says why.
-6. **Full control, no hidden behaviour.** The agent loop, its limits, error handling and termination are our own code (§7). Framework pieces are used as building blocks (graphs, messages, model clients), not as black boxes.
+6. **Explicit configuration, no hidden behaviour.** Framework components are used where they fit, but every limit, error policy and stop condition is chosen and configured in our code, and each one is tested (§7). No framework default goes unreviewed.
 
 ### Stack
 | Package | Role | Submitted? |
 |---|---|---|
-| langgraph | Orchestration: the main graph and the hand-built ReAct subgraph, conditional routing, parallel fan-out/fan-in, bounded cycles, RetryPolicy | Yes |
-| langchain-core + langchain-anthropic | Building blocks only: `ChatAnthropic`, message types, `bind_tools` schemas, structured output. **`create_agent` and agent middleware are not used** (§7). | Yes |
+| langgraph | Orchestration: the main graph, conditional routing, parallel fan-out/fan-in, bounded cycles, RetryPolicy. The risk agent is itself a compiled LangGraph graph. | Yes |
+| langchain | The risk agent (§7): `create_agent`, its middleware (tool-call and model-call limits, tool errors, refusals), `ProviderStrategy` structured output, and tools defined with `@tool` + `ToolRuntime` | Yes |
+| langchain-core + langchain-anthropic | `ChatAnthropic`, message types, `with_structured_output` for the single-call nodes, and `AnthropicPromptCachingMiddleware` for the agent | Yes |
 | python-dotenv | Load `.env` | Yes |
 | Jev client (TypeSafe) | Decision model for routing. It's **optional**: without `JEV_API_KEY` the router uses rules only. The client (official SDK or plain HTTP) is chosen after reading the official docs in step 6. | Yes (optional) |
 | langfuse | Local tracing for development only. It goes in a separate `uv` dependency group, is excluded from `requirements.txt`, and is enabled only when its keys are set. | No |
@@ -42,10 +43,10 @@ START → parse_pr → classify_pr ─┬─ simple ─────────�
 
 | Node | Kind | Responsibility |
 |---|---|---|
-| `parse_pr` | Deterministic | Validate and normalize the input, filter mechanical files, classify and prioritize files, scan for secrets and injection attempts, build the review plan (must-review files and budgets) |
+| `parse_pr` | Deterministic | Validate and normalize the input, filter mechanical files, classify and prioritize files (one `FileClassification` per file, §6), scan for secrets and injection attempts, build the review plan (must-review files and budgets) |
 | `classify_pr` | Rules + decision model (Jev) + fallback | Choose `simple` or `complex` (§3.3). A conditional edge reads its decision. |
 | `architecture_analyst` | 1 LLM call | Architectural impact. It needs no exploration, so it isn't an agent. |
-| `risk_agent` | **ReAct agent**, a hand-built LangGraph subgraph (§7) | Concrete risks backed by evidence, investigated through tools |
+| `risk_agent` | **ReAct agent**, built with `create_agent` and explicit middleware (§7) | Concrete risks backed by evidence, investigated through tools |
 | `synthesize` | 1 LLM call | Simple path: review the small diff directly. Complex path: merge the analysts' findings. On a retry it also gets the validator's feedback. |
 | `validate` | Deterministic + conditional edge | Check that the draft is grounded and consistent, with at most 1 retry (a real cycle) |
 | `finalize` | Deterministic | Compute the complexity score and calibrate confidence, then assemble the output |
@@ -55,8 +56,8 @@ START → parse_pr → classify_pr ─┬─ simple ─────────�
 |---|---|---|
 | Conditional edges | After `classify_pr`, after `validate` | The path depends on the PR and on the draft's quality |
 | Parallel fan-out / fan-in | The two analysts start together and join at `synthesize` | They're independent, so running them together halves the latency. LangGraph waits for both before `synthesize` runs. |
-| Bounded cycles | `synthesize ⇄ validate`, and `agent ⇄ tools` inside the risk agent | Self-correction (at most 1 retry), and the ReAct loop (bounded by our budgets) |
-| Subgraph | `risk_agent` | The ReAct loop is its own compiled graph with its own state. It's testable alone and appears nested in traces and Mermaid. |
+| Bounded cycles | `synthesize ⇄ validate`, and `model ⇄ tools` inside the risk agent | Self-correction (at most 1 retry), and the ReAct loop (bounded by the limit middleware, §7) |
+| Subgraph | `risk_agent` | `create_agent` returns a compiled LangGraph graph with its own state. The wrapper node invokes it, so it's testable alone and prints its own Mermaid. |
 | Reducers (`operator.add`) | `reasoning_trace`, `degraded` | Both parallel branches write to them safely |
 | `RetryPolicy` | LLM nodes | Retry when the output doesn't match the schema |
 | Input/output schemas | Graph | The caller sees `{raw_pr}` → `{output}`, and everything else stays internal |
@@ -66,7 +67,7 @@ START → parse_pr → classify_pr ─┬─ simple ─────────�
 ### Alternatives considered
 - **A single ReAct agent.** It's simpler, but it mixes responsibilities, has no guardrails, and its output is harder to validate.
 - **Three lanes with a per-file triage pre-scan via `Send`** (an earlier version of this plan). It cut costs only on 100-file PRs, but added two nodes, a clustering algorithm and a second model. It was removed: the risk agent already pulls diffs on demand, and the 1M-token context fits large PRs.
-- **`create_agent` for the risk agent.** It's quicker to write, but termination, limits, error handling and the final structured answer would live inside prebuilt middleware. Our own loop is about 150 lines, and every decision in it is visible, testable and traced (§7).
+- **A hand-built ReAct subgraph for the risk agent** (an earlier version of this plan). It made every rule our own code, but it reimplemented about 150 lines that `create_agent` already provides and tests: tool dispatch with one `ToolMessage` per call, unknown-tool and invalid-argument errors, call limits, and the structured final answer. With `create_agent`, each of those rules is still chosen explicitly through named middleware and covered by our tests (§7). The trade-off is that the loop's mechanics live in library code, so we pin the version and test the behaviour we rely on.
 - **Claude as the router.** Claude doesn't expose token probabilities, so we'd get a self-reported confidence rather than a calibrated one. A decision model returns a real probability.
 - **Jev for every routing decision.** Rules are free, exact and deterministic for the clear cases, so Jev is used only where the rules can't decide.
 
@@ -78,10 +79,12 @@ START → parse_pr → classify_pr ─┬─ simple ─────────�
 | Category | Detection |
 |---|---|
 | Lockfiles / generated / vendored | `*.lock`, `package-lock.json`, `*.min.js`, `*_pb2.py`, `generated/`, `vendor/` |
-| Binary / empty | No `@@` hunks or an empty diff |
-| Pure rename | `renamed` with no hunks |
-| Formatting only | Added and removed lines are equal after stripping whitespace |
-| Import only | Every changed line is an import statement |
+| Pure rename | `renamed` with no `@@` hunks (checked before binary/empty, because a pure rename usually has an empty diff) |
+| Binary / empty | An empty diff, or a git binary marker (`Binary files … differ`, `GIT binary patch`) |
+| Formatting only | In each hunk, the added and removed lines are the same, **in order**, after stripping trailing whitespace and collapsing inner runs of whitespace. Leading indentation must match exactly, because it is syntax in Python, so a dedent or a reordering is a code change. |
+| Import only | Python files (`.py`, `.pyi`) only: every non-blank changed line is a complete `import …` / `from … import …` statement with nothing after it (no `;`). Other languages are never import-only. |
+
+Rows are checked top to bottom, and the first match is the `filter_reason`. A non-empty diff with no `@@` hunk that matches none of these rows is **malformed**, not mechanical (§9).
 
 Filtered files are counted in the stats ("12 mechanical files skipped") and listed by the agent's tools, but they are never sent to an analyst.
 
@@ -91,14 +94,17 @@ Filtered files are counted in the stats ("12 mechanical files skipped") and list
 1. **mechanical** (the table above)
 2. **test:** `tests/`, `test_*.py`, `*_test.py`, `conftest.py`
 3. **docs:** `docs/`, `*.md`, `*.rst`, `*.txt`, `CHANGES`, `LICENSE`
-4. **config:** `pyproject.toml`, `*.cfg`, `*.ini`, `*.yaml`, `.github/workflows/`
-5. **source:** everything else, **including unknown file types**. A doubtful file is treated as code.
+4. **config:** `pyproject.toml`, `*.cfg`, `*.ini`, `*.yaml`, `*.yml`, `.github/workflows/`
+5. **source:** everything else, **including unknown file types**. A doubtful file is treated as code. A source file whose extension isn't in the known-code list in `config.py` is also flagged `is_unknown_type`, which routes `complex` (§3.3).
 
 ### 3.2 Priority and the review plan (in `parse_pr`)
 `priority = 3·is_core + 2·is_source + 1.5·is_new_module + 1·sensitive_path + log10(1+lines_changed) − 1·is_test − 2·is_docs`
 
-- `is_core` comes from the core path patterns in `project_context.md`.
-- `sensitive_path` uses generic patterns: `auth`, `security`, `session`, `crypto`, `config`, `middleware`, `migrations`.
+- `is_core` comes from the core path patterns (globs) in the `## Core paths` section of `project_context.md`. A project without that section has no core files.
+- `sensitive_path` uses generic patterns, matched as case-insensitive substrings of the path: `auth`, `security`, `session`, `crypto`, `config`, `middleware`, `migrations`. It applies only to code files (source, config and test), so a docs-only PR such as `docs/config.rst` still routes `simple`. Over-matching on code files is accepted, because it only makes routing more thorough.
+- `is_new_module` means an added source file.
+- `lines_changed` is the recomputed `lines_added + lines_removed`.
+- Priority is computed for every file, filtered ones included, and stored in `FileClassification`.
 - The weights live in `config.py`.
 
 `parse_pr` turns the priorities into a **`ReviewPlan`**, which both analysts read:
@@ -205,10 +211,13 @@ One Claude model means one prompt cache and one set of behaviours to handle. Mod
 ### Claude API behaviours that shape the code
 1. **Thinking is always on,** and `effort` is the control. Every node sets its effort explicitly.
 2. **No `temperature`/`top_p`** (they return a 400). Consistency comes from the deterministic nodes and strict schemas.
-3. **Forced tool choice returns a 400,** so structured output must use **native JSON-schema structured outputs**: `with_structured_output(method="json_schema")`. This is also why the agent's final answer is a separate structured call (§7) rather than a forced "answer" tool. *Verify the exact path against the installed `langchain-anthropic` at implementation.*
-4. **Refusals** (`stop_reason: "refusal"`) can be false positives on security-related diffs. Enable the server-side fallback (`fallbacks: "default"`). A final refusal is handled as a degraded stage.
-5. **Prompt caching:** static content (instructions, project context) goes first, and PR content last. We set the `cache_control` breakpoints ourselves: one on the system prompt, and one on the latest message of each agent turn, so the growing history is cached incrementally. *Verify how `langchain-anthropic` expresses `cache_control` at implementation.*
-6. **Thinking blocks in the tool loop:** with thinking on, each assistant turn must be sent back unchanged, thinking blocks included, or the API rejects the next request. Our loop appends the model's `AIMessage` as-is and never rewrites it.
+3. **Forced tool choice returns a 400,** so structured output must use **native JSON-schema structured outputs**:
+   - the single-call nodes use `with_structured_output(method="json_schema")`,
+   - the agent uses `response_format=ProviderStrategy(RiskFindings)`. **`ToolStrategy` is not used**, because it binds the tools with `tool_choice="any"` (checked in the `langchain` 1.4.9 source). `langchain-anthropic` 1.7.10 maps `ProviderStrategy` to Anthropic's `output_config.format`.
+   - *Verify at implementation:* that the native format works alongside tool calls and thinking on a real run.
+4. **Refusals** (`stop_reason: "refusal"`) can be false positives on security-related diffs. Enable the server-side fallback (`fallbacks: "default"`). A final refusal is handled as a degraded stage. In the agent, `ModelRefusalMiddleware` turns it into an error, so it can't be mistaken for a final answer.
+5. **Prompt caching:** static content (instructions, project context) goes first, and PR content last. In the agent, `AnthropicPromptCachingMiddleware` tags the system prompt and the tool definitions and caches the message tail, so the growing history is cached on every turn. The single-call nodes put a `cache_control` breakpoint on the system prompt. *Verify the cache hits in the usage metadata at implementation.*
+6. **Thinking blocks in the tool loop:** with thinking on, each assistant turn must be sent back unchanged, thinking blocks included, or the API rejects the next request. `create_agent` appends the model's `AIMessage` to the state as-is, and none of our middleware rewrites messages. *Verify on a multi-turn run in Phase 5.*
 7. **`max_tokens` of about 16K** per call, because thinking counts toward it.
 8. **1M context:** even huge PRs fit. The budgets exist for **focus and cost**, not to fit the window.
 
@@ -233,10 +242,26 @@ class RouteDecision(BaseModel):
     probability: float | None                      # P(simple), set only when Jev decided
     reason: str
 
+class FileClassification(BaseModel):              # system-generated, one per file; never read from the input
+    path: str
+    status: Literal["added", "modified", "deleted", "renamed"]   # mapped from the raw status (§9)
+    status_was_unknown: bool
+    lines_added: int                               # recomputed from the diff
+    lines_removed: int
+    category: Literal["mechanical", "test", "docs", "config", "source"]
+    filter_reason: str | None                      # mechanical files only
+    is_core: bool
+    is_sensitive: bool
+    is_new_module: bool
+    is_unknown_type: bool
+    is_malformed: bool
+    priority: float
+
 class ReviewState(TypedDict):
     raw_pr: dict                                   # input
-    pr: PRInput                                    # normalized, files classified + prioritized
-    stats: PRStats                                 # counts, token estimate, filtered files, scan hits
+    pr: PRInput                                    # validated input data only (duplicate paths merged)
+    classifications: dict[str, FileClassification] # path → derived facts (set by parse_pr)
+    stats: PRStats                                 # counts (incl. filtered), token estimate, scan hits
     plan: ReviewPlan                               # ranked_files, must_review, budgets (set by parse_pr)
     route: RouteDecision                           # set by classify_pr
     architecture: ArchitectureFindings | None
@@ -251,88 +276,101 @@ class ReviewState(TypedDict):
 ```
 
 - **Graph interface:** input `{raw_pr}`, output `{output}`. Everything else is internal working memory.
+- **Raw data and derived data are kept apart.** `ChangedFile` and `PRInput` hold only fields from the PR JSON. Unknown keys are dropped, so the input can't supply a category, priority or flag. Everything the system derives lives in `classifications`. When a path repeats, `parse_pr` merges the entries into one `ChangedFile`: the diffs are joined in order, and the first entry's status is kept. The untouched original stays in `raw_pr`.
 - **Not in the main state:**
-  - the agent's message history (it lives only in the subgraph's `AgentState` and is discarded after the node),
+  - the agent's message history (it lives only in the agent's own state and is discarded after the node),
   - the tool context (the PR given to the tools, read-only),
   - config and secrets.
 
-### The risk agent's own state (subgraph)
+### The risk agent's own state
+`create_agent`'s `AgentState` already holds `messages` and, with `response_format`, `structured_response`. The limit middleware keeps its call counters in private state. We extend it with one field:
+
 ```python
-class AgentState(TypedDict):
-    messages: Annotated[list[AnyMessage], add_messages]   # system, user, AI turns, tool results
-    model_calls: int                                      # counted by the agent node
-    tool_calls: int                                       # counted by the tools node
-    files_inspected: Annotated[list[str], operator.add]   # recorded by the tools node on each read
-    budget_exhausted: bool
-    findings: RiskFindings | None                         # set by the respond node
+class RiskAgentState(AgentState):
+    files_inspected: Annotated[list[str], operator.add]   # recorded by read_file_diff via Command(update=...)
+```
+
+The read-only tool context is a separate `context_schema` and is never part of the state:
+
+```python
+@dataclass(frozen=True)
+class RiskAgentContext:
+    pr: PRInput
+    classifications: dict[str, FileClassification]
+    project_context: str
 ```
 
 The `risk_agent` node in the main graph is a thin wrapper:
-1. it builds the initial messages and budgets from the main state,
-2. it invokes the compiled subgraph,
-3. it maps only `findings`, `files_inspected` and `budget_exhausted` back to the main state.
+1. it builds the system prompt, the budgets and the agent from the main state,
+2. it invokes the agent with `context=RiskAgentContext(...)`,
+3. it maps only the findings, `files_inspected` and `budget_exhausted` back to the main state.
 
 The two states stay independent.
 
 ---
 
-## 7. The risk agent: a hand-built ReAct loop (`risk_agent`)
+## 7. The risk agent: `create_agent` with explicit middleware (`risk_agent`)
 
-### Why not `create_agent`
-`create_agent` hides the loop: how the agent stops, how limits apply, how tool errors are handled, and how the final structured answer is produced. All of that lives inside prebuilt middleware. A reviewer can't see those decisions, and we can't test them directly.
+### Why `create_agent`
+The risk agent is a standard tool-calling loop. LangChain's `create_agent` provides that loop as a compiled LangGraph graph, along with tool dispatch (the prebuilt `ToolNode`), limits, error handling and a structured final answer, each as a separate, named middleware. We use it instead of rebuilding those parts (§2, alternatives).
 
-Instead, the loop is a **small LangGraph subgraph we write ourselves**, so every one of those decisions is explicit code.
+What stays under our control: every behaviour the loop has is one we chose and configured below. We take no defaults we haven't reviewed. Retries, summarization and context editing are not enabled (§11), and each rule we rely on has a test.
 
 ```
-START → agent ─┬─ has tool calls ──► tools ─┬─ budget left ──► agent   (loop)
-               │                            └─ exhausted ────► respond
-               └─ no tool calls ────────────────────────────► respond → END
+START → model ─┬─ has tool calls ──► tools ──► model   (loop, bounded by the limit middleware)
+               └─ final answer ───► END       (structured_response: RiskFindings)
 ```
 
-### Nodes
-| Node | What it does |
-|---|---|
-| `agent` | One call to `ChatAnthropic.bind_tools(TOOL_SCHEMAS)` (effort: high) over `messages`, then increment `model_calls`. The `AIMessage` is appended unchanged, thinking blocks included (§5). |
-| `tools` | **Our own executor** (not the prebuilt `ToolNode`). For each tool call in the last `AIMessage`: validate the arguments, dispatch to the Python function with the PR context, record files read in `files_inspected`, and increment `tool_calls`. It returns **one `ToolMessage` per tool call**, which the API requires, even when the call fails or is over budget. |
-| `respond` | **One structured call**, `with_structured_output(RiskFindings, method="json_schema")` over the conversation: *"Report only findings backed by evidence you saw."* This path is the same whether the agent finished on its own or ran out of budget, so the "limit hit" case needs no special fallback. |
+### Configuration
+| Concern | Provided by | Our configuration |
+|---|---|---|
+| Model | `ChatAnthropic` from `llm.py` | Opus 5.5, effort high, `max_tokens` ~16K, server-side refusal fallback (§5) |
+| System prompt | `system_prompt=` | Built in plain code by the wrapper (see below) |
+| Tools | `@tool` with a Pydantic `args_schema` | 4 read-only tools (below) |
+| PR context for the tools | `context_schema=RiskAgentContext`, read through `ToolRuntime` | Passed at invoke time and hidden from the model's tool schema. No globals. |
+| Files read | `state_schema=RiskAgentState` | `read_file_diff` returns `Command(update={"files_inspected": [path], "messages": [...]})` |
+| Tool budget | `ToolCallLimitMiddleware(run_limit=max_tool_calls, exit_behavior="continue")` | Over-budget calls get an error `ToolMessage` ("Tool call limit exceeded…") and the model goes on to answer |
+| Model-call backstop | `ModelCallLimitMiddleware(run_limit=max_model_calls, exit_behavior="end")` | Ends the run only if the model keeps requesting blocked tools after its tool budget is spent |
+| Tool errors | `ToolNode` built-ins + `ToolErrorMiddleware(on_error=...)` | See "Tool error handling" |
+| Final answer | `response_format=ProviderStrategy(RiskFindings)` | Native JSON schema. Not `ToolStrategy`, which forces `tool_choice` (§5). |
+| Refusals | `ModelRefusalMiddleware` | A refusal raises an error, and the wrapper degrades the node (§9) |
+| Prompt caching | `AnthropicPromptCachingMiddleware` (langchain-anthropic) | Caches the system prompt, tool definitions and message tail (§5) |
 
-### Routing (two conditional edges)
-- **After `agent`:** go to `tools` if the last message has tool calls, otherwise go to `respond`.
-- **After `tools`:** go to `respond` if `model_calls ≥ max_model_calls` or `tool_calls ≥ max_tool_calls`, otherwise go back to `agent`.
-- **Backstop:** the subgraph is invoked with `recursion_limit = 2 × max_model_calls + 5`. It should never trigger. If it does, the node degrades (§9).
+The agent is created once per run, inside the wrapper, because its budgets depend on the PR.
 
 ### Budgets, from the review plan (§3.2)
 - `max_tool_calls = clamp(8 + 2 × code_files, 8, 30)`
-- `max_model_calls = max_tool_calls // 2 + 2`. Claude can request several tools in one turn.
-- When a turn requests more tools than the remaining budget allows, the extra calls get a *"budget exhausted"* `ToolMessage`, and the loop moves to `respond`.
+- `max_model_calls = max_tool_calls + 2`. Every non-final turn uses at least one tool call, so the tool budget is the real limit on cost. The model-call limit is only a backstop: one call to answer after the last tool result, plus one call of slack for a turn whose tools were blocked. A tighter value would end normal one-tool-per-turn runs before the tool budget is spent, with no answer.
+- **Normal stop:** the model answers without tool calls, and `structured_response` is set.
+- **Tool budget used up:** further calls are blocked with an error `ToolMessage`, and the model answers with what it has.
+- **Model-call limit reached:** the run ends without a `structured_response`. The wrapper then makes **one structured call**, `with_structured_output(RiskFindings, method="json_schema")`, over the conversation: *"Report only findings backed by evidence you saw."* Every path therefore ends with findings or a degraded node.
+- **`budget_exhausted`** is true if the agent requested more tool calls than its budget (counted from the AI messages' `tool_calls`), or if the model-call limit ended the run. It caps confidence (§8).
+- **Backstop:** the agent is invoked with a `recursion_limit` set above what the two limits allow. With this middleware, each model turn takes several graph steps, so the exact value is computed and tested in Phase 5. It should never trigger. If it does, the node degrades (§9).
 
 ### Tools
-Each tool has two parts:
-- **A Pydantic argument schema**, bound to the model with `bind_tools`.
-- **A plain Python function** `fn(ctx, args) -> str`.
-
-A registry maps `name → (schema, fn)`. The executor passes the read-only PR context **explicitly**, with no globals and no runtime injection.
+Each tool is a `@tool` function with a Pydantic `args_schema` and a `runtime: ToolRuntime[RiskAgentContext]` parameter. The runtime is injected and isn't shown to the model. Tools are pure reads over the PR context.
 
 | Tool | Returns |
 |---|---|
-| `list_changed_files()` | Path, status, +/-, category, priority, and a flag for filtered files |
+| `list_changed_files()` | Path, status, +/-, category, priority, and a flag for filtered files (from `classifications`) |
 | `read_file_diff(path, page=1)` | The hunk headers plus one page (~400 lines) of the diff, with "page X of N" |
 | `search_diff(pattern)` | Regex hits across all diffs as `file:line: text` (at most 50 hits) |
 | `read_project_context(topic)` | A section of `project_context.md` |
 
-### Tool error handling (in the executor)
+Claude can request several tools in one turn. `ToolNode` may run them concurrently. That's safe, because the tools only read, and `files_inspected` uses an `operator.add` reducer. Results are matched to their calls by `tool_call_id`.
+
+### Tool error handling
 Each error becomes a `ToolMessage` with `status="error"` and a message the agent can act on. The loop never crashes.
 
-| Error | Message back to the agent |
-|---|---|
-| Unknown tool name | The list of valid tools |
-| Arguments fail schema validation | The validation errors |
-| Unknown file path | The 3 closest paths (`difflib`) |
-| Invalid regex | The regex error, plus a hint to escape the special characters |
-| Page out of range | The valid page range |
-| Any other exception | The exception type and message, with no stack trace |
-
-Claude can request several tools in one turn. They're in-memory and take microseconds, so the executor runs them **in order**, and the results go back in that same order.
+| Error | Handled by | Message back to the agent |
+|---|---|---|
+| Unknown tool name | `ToolNode` (built in) | The list of valid tools |
+| Arguments fail schema validation | `ToolNode` (built in) | The validation errors |
+| Unknown file path | Our tool raises `ToolInputError` → `ToolErrorMiddleware` | The 3 closest paths (`difflib`) |
+| Invalid regex | `ToolInputError` → `ToolErrorMiddleware` | The regex error, plus a hint to escape the special characters |
+| Page out of range | `ToolInputError` → `ToolErrorMiddleware` | The valid page range |
+| Over the tool budget | `ToolCallLimitMiddleware` | "Tool call limit exceeded. Do not make additional tool calls." |
+| Any other exception | `ToolErrorMiddleware` | The exception type and message, with no stack trace |
 
 ### System prompt
 It's built in plain code by the wrapper node, from the PR overview and `must_review`. It holds:
@@ -344,13 +382,11 @@ It's built in plain code by the wrapper node, from the PR overview and `must_rev
 ### Post-processing (in the wrapper node, deterministic)
 - **Hallucination guards:**
   - findings that name a file not in the PR are dropped,
-  - each `evidence` must appear in the diff (compared after normalizing whitespace). If it doesn't, the finding is marked *unverified*, its severity drops one level, and confidence is lowered.
-- **Coverage check:** unread `must_review` files become "verify" focus areas (§3.4). `files_inspected` is recorded by the executor as it runs, so there's no parsing of the message history afterwards.
+  - each `evidence` must appear in the diff (compared after normalizing whitespace). If it doesn't, the finding is marked *unverified*, its severity drops one level, and confidence is lowered. The guards set `verified` on every finding. The field is hidden from the schema the model fills (`SkipJsonSchema`), so the model can't claim it.
+- **Coverage check:** unread `must_review` files become "verify" focus areas (§3.4). `files_inspected` comes from the agent's state, where `read_file_diff` records each read as it runs.
 
-### What this gives us over `create_agent`
-- **Every rule is visible in code we own:** stop conditions, budgets, error messages and the final answer.
-- **Testable without an API key:** a scripted fake chat model that returns preset tool calls can exercise the budget stop, the error paths and coverage tracking.
-- **One clear trace:** the `agent`, `tools` and `respond` steps show up as nested spans.
+### Testing without an API key
+`create_agent` accepts any `BaseChatModel`. A scripted fake chat model returns preset tool calls and a final JSON answer, which exercises the budget stop, the model-call backstop and its recovery call, the error paths and coverage tracking. The fake must accept `bind_tools(..., response_format=...)`. Build it in Phase 5.
 
 ---
 
@@ -373,7 +409,9 @@ It's built in plain code by the wrapper node, from the PR overview and `must_rev
 ### `validate`
 **Checks:**
 1. Every focus area names a changed file.
-2. The risk level is consistent with the findings (complex path), or with the deterministic signals (simple path).
+2. The risk level is consistent:
+   - complex path: it isn't below the highest severity among the *verified* risk findings,
+   - both paths: a secret scan hit requires `high` (§9).
 3. Required fields are non-empty.
 
 On failure it loops back to synthesize once, passing the errors and the previous draft.
@@ -389,7 +427,7 @@ On failure it loops back to synthesize once, passing the errors and the previous
 | `core` | 1.5 per core file, max 3 |
 | `new_modules` | 0.5 each, max 1 |
 
-Example: the sample PR scores 5.5 and a docs typo scores 1.0. The weights live in config, and the README notes that the score measures structure, not subtlety.
+Each term is clamped to `[0, max]`, and rounding is half-up. Example: the sample PR scores 5.5 and a docs typo scores 1.0. The weights live in config, and the README notes that the score measures structure, not subtlety.
 
 **`confidence` (0–1):** start from the LLM's value. **Subtract the penalties**, then **apply the caps with `min()`**, then clamp to [0.1, 0.95].
 
@@ -432,10 +470,10 @@ Each adjustment is written to the trace.
 | Schema errors | Exit 2, listing **all** Pydantic errors with field paths |
 | Missing optional fields (`pr_description`, `author`) | Default to empty and note it |
 | Unknown extra fields | Ignored |
-| Unknown `status` | Mapped to a known value (`removed` → `deleted`). Otherwise `modified`, with a warning. |
-| Line counts don't match the diff | Trust the diff, recompute, warn |
+| Unknown `status` | `ChangedFile` keeps the raw value. `parse_pr` maps it into `FileClassification.status` (`removed` → `deleted`), and anything unknown becomes `modified`, with a warning. |
+| Line counts don't match the diff | Trust the diff: the recomputed counts go in `FileClassification`, with a warning |
 | Duplicate paths | Merge and warn |
-| Malformed diff (no `@@`) | Treat as raw text, flag it, route `complex`, cap confidence |
+| Malformed diff (no `@@`, not mechanical, §3.1) | Treat as raw text, flag it (`is_malformed`), keep the reported line counts (the diff can't be counted), route `complex`, cap confidence |
 | `changed_files` empty | Exit 2 |
 | Only mechanical files | Simple path, stated in the review |
 
@@ -455,14 +493,14 @@ A routing fallback is a **safe default, not a degradation**. The review is still
 | 429, 5xx, timeout, connection error | Anthropic SDK `max_retries=3` with exponential backoff |
 | Output doesn't match the schema | Node `RetryPolicy(max_attempts=2)`, retrying only on validation errors |
 | 400 / 401 / 403 | Fail fast |
-| Refusal | Server-side fallback (§5), then degraded |
+| Refusal | Server-side fallback (§5), then degraded. In the agent, `ModelRefusalMiddleware` raises the error. |
 
 ### Degradation when a node fails after retries
 | Node | Result |
 |---|---|
 | `architecture_analyst` | `None`; synthesize works from risk findings only |
 | `risk_agent` | `None`; synthesize works from architecture findings only |
-| `synthesize` | **Deterministic fallback review:** risk level from the heuristics, focus areas = the top-priority files, confidence 0.2, exit 3 |
+| `synthesize` | **Deterministic fallback review:** risk level `high` on a secret scan hit, `medium` on any core, sensitive, new-module or deleted source file or an injection hit, otherwise `low`. Focus areas = the top-priority files, confidence 0.2, exit 3. |
 
 ### Untrusted input
 - **Prompt injection:**
@@ -487,7 +525,7 @@ A routing fallback is a **safe default, not a degradation**. The review is still
 2. **Parallelism:** the two analysts run at the same time.
 3. **Effort per node** (§5): low on the simple path, high only for the risk agent.
 4. **Cheap decisions first:** the rules are free, and Jev is called only for the uncertain middle.
-5. **Prompt caching:** static-first prompt order, plus our own `cache_control` breakpoints in the agent loop, so each turn reuses the cached history.
+5. **Prompt caching:** static-first prompt order, plus `AnthropicPromptCachingMiddleware` in the agent loop, so each turn reuses the cached history.
 6. **Budgets that scale with the PR,** within hard caps.
 7. **Usage accounting:** tokens in/out and estimated cost go into the trace, which works without Langfuse.
 
@@ -496,13 +534,14 @@ A routing fallback is a **safe default, not a degradation**. The review is still
 ## 11. Deliberately not built
 - **Checkpointer / Store:** this is a one-shot CLI and the assignment forbids persistence. The README explains when we'd add them: multi-turn follow-ups, resuming, HITL via `interrupt()`, long-term memory of maintainer preferences.
 - **A per-file pre-scan (`Send` map-reduce):** see the alternatives in §2.
-- **Prebuilt agent abstractions** (`create_agent`, agent middleware, the prebuilt `ToolNode`): replaced by our own subgraph for full control (§7).
-- **`ModelRetryMiddleware`-style retries in the loop:** the Anthropic SDK already retries transient errors (§9), and stacking retry layers multiplies the wait.
-- **Summarization or context editing in the loop:** the agent's conversations are short and bounded by our budgets.
+- **Retry middleware in the agent** (`ModelRetryMiddleware`, `ToolRetryMiddleware`): the Anthropic SDK already retries transient errors (§9), the tools are in-memory reads, and stacking retry layers multiplies the wait.
+- **Summarization or context editing in the agent** (`SummarizationMiddleware`, `ContextEditingMiddleware`): the agent's conversations are short and bounded by our budgets.
+- **Other agent middleware** (`ModelFallbackMiddleware`, human-in-the-loop, PII, to-do list, LLM tool selection, tool emulation): none of them solves a problem this agent has. Refusals use the server-side fallback instead (§5).
+- **`create_agent` for the other LLM nodes:** `architecture_analyst` and `synthesize` have no tools, so each is one structured call, not an agent.
 - **Vector DB / RAG:** the project context is one page. It would become justified with full-repo context (§4).
 - **LLM response cache across runs:** that's persistence.
 - **Streaming and the Batch API:** this is a batch CLI, and the Batch API's asynchronous latency is wrong for a CLI.
-- **Eval datasets, Langfuse scores, more than one test.**
+- **Eval datasets, Langfuse scores, more than one test module.**
 
 ---
 
@@ -524,46 +563,25 @@ src/agent_workflow/
   config.py          # models, effort per node, routing thresholds, Jev threshold, weights, budgets
   llm.py             # Claude factory: ChatAnthropic, effort, fallbacks, structured-output helper
   router.py          # classify_pr: hard rules, Jev client, fallback
-  schemas.py         # Pydantic models (input, plan, route decision, findings, draft, output)
+  schemas.py         # Pydantic models (raw input, file classification, stats, plan, route decision, findings, draft, output)
   state.py           # ReviewState + reducers
   prompts.py         # all prompts (static content first)
   preprocessing.py   # normalize, noise filter, classify, priority, review plan, scans, API surface
-  scoring.py         # complexity, confidence, deterministic fallback review
-  tools.py           # 4 tools: arg schemas + functions + registry, and the executor with error handling
-  risk_agent.py      # ReAct subgraph: AgentState, agent/tools/respond nodes, routing, budgets, wrapper, guards
+  scoring.py         # deterministic post-LLM logic: complexity, confidence, draft checks (validate), fallback review
+  tools.py           # 4 @tool functions with arg schemas, ToolRuntime context, ToolInputError + on_error handler
+  risk_agent.py      # create_agent config: RiskAgentState, RiskAgentContext, middleware, budgets, wrapper, recovery call, guards
   nodes.py           # graph nodes
   graph.py           # build_graph(): routing, parallel analysts, cycle, RetryPolicy
   observability.py   # optional Langfuse handler (dev only)
   project_context.md # Flask conventions + core path patterns (swappable)
-tests/test_pipeline.py           # one deterministic test: preprocessing + routing rules + scoring, no API key
+tests/test_pipeline.py           # one deterministic test module: preprocessing + routing rules + scoring, no API key
 ```
 
 ---
 
 ## 14. Implementation steps (to do together)
 
-Each step ends with something runnable, which we review before moving on.
-
-- [x] **0. Housekeeping:** add `.env` to `.gitignore`.
-- [ ] **1. Setup & schemas:** replace `langchain-openai` with `langchain-anthropic`, add `ANTHROPIC_API_KEY` (and an optional `JEV_API_KEY`) to `.env.example`, move langfuse into a dev group, add `pr_input.json`, write `schemas.py` and `state.py`. *Check:* the sample loads and validates, and bad inputs give clear errors.
-- [ ] **2. Deterministic layer:** `preprocessing.py` (including the review plan), the rules part of `router.py`, `scoring.py`, `validate`, and the test. *Check:* run it on the sample, on a docs-only PR, on a one-line comment fix (it should land in the uncertain middle) and on a synthetic 60-file PR.
-- [ ] **3. Graph skeleton:** `graph.py` with every LLM node stubbed and both paths wired up. *Check:* it compiles, prints Mermaid, and both paths run end to end on stubs.
-- [ ] **4. LLM foundation:** `llm.py` (verify structured output, effort, fallbacks and caching against the installed `langchain-anthropic`), then `architecture_analyst` and `synthesize` (both modes). *Check:* the first real run on the sample.
-- [ ] **5. ReAct agent (hand-built):**
-  - `tools.py` (the registry and the executor),
-  - `project_context.md`,
-  - `risk_agent.py` (the subgraph, budgets and wrapper),
-  - the hallucination guards and the coverage check.
-
-  *Check:*
-  - the subgraph prints its own Mermaid,
-  - on the sample PR, the tool calls make sense,
-  - a forced tiny budget ends the loop cleanly in `respond`,
-  - a bad path or regex comes back as a recoverable error.
-- [ ] **6. Jev router:** read the official Jev docs first, then add the client, the threshold and every fallback in §9. *Check:* the uncertain-middle PRs are routed with and without `JEV_API_KEY`, a simulated timeout falls back to `complex`, and the trace shows the decision source.
-- [ ] **7. Degradation & CLI:** fallbacks per node, exit codes, the atomic write. *Check:* simulated failures produce degraded output with exit code 3.
-- [ ] **8. Langfuse tracing (dev only).** *Check:* a nested trace appears in your UI.
-- [ ] **9. Deliverables:** `code_review_output.json`, `requirements.txt` and the README (design, trade-offs, the Jev decision and fallback, AI-tool usage, what was new to you).
+Implementation phases, their checks and progress are tracked in [`docs/phases.md`](phases.md).
 
 ## 15. Before we start
 - **Step 1:** put the full `pr_input.json` in the repo root, and add `ANTHROPIC_API_KEY` to `.env`.
