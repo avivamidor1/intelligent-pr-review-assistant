@@ -8,10 +8,11 @@ authors = [
 ]
 requires-python = ">=3.12"
 dependencies = [
-    "langchain>=1.4.8",
-    "langchain-openai>=1.7.3",
-    "langfuse>=5.1.0",
+    "langchain>=1.4.9",
+    "langchain-anthropic>=1.7.10",
+    "langchain-core>=1.7.7",
     "langgraph>=1.2.19",
+    "pydantic>=2.14.2",
     "python-dotenv>=1.2.4",
 ]
 
@@ -21,3 +22,8 @@ agent-workflow = "agent_workflow:main"
 [build-system]
 requires = ["uv_build>=0.13.6,<0.14.0"]
 build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "langfuse>=5.2.0",
+]
