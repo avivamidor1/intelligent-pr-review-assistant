@@ -11,14 +11,24 @@ from __future__ import annotations
 
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, NonNegativeInt, StringConstraints, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    NonNegativeInt,
+    StringConstraints,
+    field_validator,
+    model_validator,
+)
 from pydantic.json_schema import SkipJsonSchema
+
+from . import config
 
 Level = Literal["low", "medium", "high"]
 FileStatus = Literal["added", "modified", "deleted", "renamed"]
 FileCategory = Literal["mechanical", "test", "docs", "config", "source"]
 
-_LEVEL_ORDER: dict[Level, int] = {"low": 0, "medium": 1, "high": 2}
+LEVEL_ORDER: dict[Level, int] = {"low": 0, "medium": 1, "high": 2}
 
 NonEmptyStr = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
 
@@ -37,7 +47,14 @@ class ChangedFile(BaseModel):
     status: NonEmptyStr  # raw value; mapped to FileStatus by preprocessing (FileClassification.status)
     lines_added: NonNegativeInt  # as reported; preprocessing recomputes from the diff
     lines_removed: NonNegativeInt
-    diff: str
+    # A missing or null diff (e.g. a binary or oversized file) becomes "". Preprocessing
+    # then treats an empty diff with reported changes as a missing patch (PLAN.md §9).
+    diff: str = ""
+
+    @field_validator("diff", mode="before")
+    @classmethod
+    def _none_to_empty(cls, value: Any) -> Any:
+        return "" if value is None else value
 
 
 class PRInput(BaseModel):
@@ -76,12 +93,12 @@ class FileClassification(BaseModel):
     lines_added: NonNegativeInt  # recomputed from the diff
     lines_removed: NonNegativeInt
     category: FileCategory
-    filter_reason: str | None = None  # set only for mechanical files, e.g. "lockfile", "formatting only"
+    filter_reason: str | None = None  # set only for mechanical files, e.g. "lockfile/generated/vendored", "formatting only"
     is_core: bool = False
     is_sensitive: bool = False
     is_new_module: bool = False
     is_unknown_type: bool = False  # categorised as source by default (§3.1)
-    is_malformed: bool = False  # non-empty diff with no @@ hunks
+    is_malformed: bool = False  # no @@ hunk: non-empty raw text, or a missing patch (reported changes, §9)
     priority: float
 
 
@@ -125,7 +142,16 @@ class Finding(BaseModel):
     evidence: str  # must appear in the diff; checked by the hallucination guards
     severity: Level
     # System-set by the hallucination guards (PLAN.md §7); hidden from the schema the model fills.
-    verified: SkipJsonSchema[bool] = True
+    # Any "verified" in the input is dropped, so a model can't claim it: only a guard sets it,
+    # with finding.model_copy(update={"verified": True}).
+    verified: SkipJsonSchema[bool] = False
+
+    @model_validator(mode="before")
+    @classmethod
+    def _drop_verified(cls, data: Any) -> Any:
+        if isinstance(data, dict) and "verified" in data:
+            return {key: value for key, value in data.items() if key != "verified"}
+        return data
 
 
 class ArchitectureFindings(BaseModel):
@@ -145,7 +171,7 @@ class RiskFindings(BaseModel):
         """
         if not self.findings:
             return None
-        return max((f.severity for f in self.findings), key=_LEVEL_ORDER.__getitem__)
+        return max((f.severity for f in self.findings), key=LEVEL_ORDER.__getitem__)
 
 
 class FocusArea(BaseModel):
@@ -157,7 +183,7 @@ class ReviewDraft(BaseModel):
     risk_level: Level
     risk_reasoning: str
     architectural_impact: str
-    review_focus_areas: list[FocusArea] = Field(min_length=1, max_length=6)
+    review_focus_areas: list[FocusArea] = Field(min_length=1, max_length=config.MAX_FOCUS_AREAS)
     confidence: float = Field(ge=0, le=1)
     confidence_reasoning: str
 
@@ -173,7 +199,7 @@ class ReviewOutput(BaseModel):
     risk_level: Level
     risk_reasoning: str
     architectural_impact: str
-    review_focus_areas: list[str] = Field(max_length=6)  # "path: concern"
+    review_focus_areas: list[str] = Field(max_length=config.MAX_FOCUS_AREAS)  # "path: concern"
     complexity_score: float = Field(ge=1, le=10)
     confidence: float = Field(ge=0, le=1)
     reasoning_trace: list[str]

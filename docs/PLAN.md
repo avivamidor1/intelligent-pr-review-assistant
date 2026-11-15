@@ -80,11 +80,11 @@ START → parse_pr → classify_pr ─┬─ simple ─────────�
 |---|---|
 | Lockfiles / generated / vendored | `*.lock`, `package-lock.json`, `*.min.js`, `*_pb2.py`, `generated/`, `vendor/` |
 | Pure rename | `renamed` with no `@@` hunks (checked before binary/empty, because a pure rename usually has an empty diff) |
-| Binary / empty | An empty diff, or a git binary marker (`Binary files … differ`, `GIT binary patch`) |
-| Formatting only | In each hunk, the added and removed lines are the same, **in order**, after stripping trailing whitespace and collapsing inner runs of whitespace. Leading indentation must match exactly, because it is syntax in Python, so a dedent or a reordering is a code change. |
-| Import only | Python files (`.py`, `.pyi`) only: every non-blank changed line is a complete `import …` / `from … import …` statement with nothing after it (no `;`). Other languages are never import-only. |
+| Binary / empty | An empty diff, or a git binary marker (`Binary files … differ`, `GIT binary patch`). An empty diff **with reported changes** is not mechanical: its patch is missing (§9). |
+| Formatting only | In each change block (a run of removed and added lines between context lines), the removed and added lines are the same, **in order**, after stripping **trailing whitespace only**. Leading indentation and inner whitespace must match exactly: indentation is syntax in Python, and whitespace inside a string literal changes behaviour. So a dedent, a reordering, a line moved past a context line, or `"  "` → `" "` is a code change. |
+| Import only | Python files (`.py`, `.pyi`) only: every non-blank changed line is a complete `import …` / `from … import …` statement with nothing after it (no `;`). Other languages are never import-only, and neither is `__init__.py`/`__init__.pyi`: its imports are the package's public API. |
 
-Rows are checked top to bottom, and the first match is the `filter_reason`. A non-empty diff with no `@@` hunk that matches none of these rows is **malformed**, not mechanical (§9).
+Rows are checked top to bottom, and the first match is the `filter_reason`. An **added or deleted** file can only match the lockfile/generated/vendored row or a binary marker: adding or removing a module is a structural change even if it holds only imports or nothing at all (e.g. an empty `__init__.py`). A non-empty diff with no `@@` hunk that matches none of these rows is **malformed**, not mechanical (§9).
 
 Filtered files are counted in the stats ("12 mechanical files skipped") and listed by the agent's tools, but they are never sent to an analyst.
 
@@ -93,8 +93,8 @@ Filtered files are counted in the stats ("12 mechanical files skipped") and list
 **File categories** are checked in this order, and the first match wins:
 1. **mechanical** (the table above)
 2. **test:** `tests/`, `test_*.py`, `*_test.py`, `conftest.py`
-3. **docs:** `docs/`, `*.md`, `*.rst`, `*.txt`, `CHANGES`, `LICENSE`
-4. **config:** `pyproject.toml`, `*.cfg`, `*.ini`, `*.yaml`, `*.yml`, `.github/workflows/`
+3. **docs:** `docs/`, `*.md`, `*.rst`, `*.txt`, `CHANGES`, `LICENSE`. **Exception:** `requirements*.txt` is checked just before this rule and is **config**, because a dependency manifest changes what gets installed.
+4. **config:** `pyproject.toml`, `*.cfg`, `*.ini`, `*.yaml`, `*.yml`, `.github/workflows/`, and `requirements*.txt` (see above)
 5. **source:** everything else, **including unknown file types**. A doubtful file is treated as code. A source file whose extension isn't in the known-code list in `config.py` is also flagged `is_unknown_type`, which routes `complex` (§3.3).
 
 ### 3.2 Priority and the review plan (in `parse_pr`)
@@ -125,11 +125,11 @@ The routing decision has three layers, from safest to least safe.
 |---|---|
 | Only docs and/or mechanical files changed, and no scan hit | `simple` |
 | A secret or injection scan hit | `complex` |
-| Any core file, sensitive path, new module or deleted source file | `complex` |
+| Any core file, sensitive path, new module or deleted source file (non-filtered files only: a formatting- or import-only change to a core file has nothing to review) | `complex` |
 | More than 3 code files, or more than 50 changed code lines | `complex` |
 | Unknown file type or malformed diff | `complex` |
 
-Code files are source, config and test files. The thresholds live in `config.py`.
+Code files are source, config and test files. The thresholds live in `config.py`. A dependency-only PR (`requirements*.txt` is config) has no special rule: it lands in the uncertain middle. A lockfile-only PR is mechanical and routes `simple`.
 
 **Layer 2: the decision model (Jev)**, only for the **uncertain middle**: small code changes (≤3 code files, ≤50 changed lines, nothing core, sensitive or new). Here rules can't tell a comment typo or version bump from a real logic change.
 - **Input:** a bounded payload. It holds the title, the description (truncated), the file list with categories and +/- counts, and the changed lines (up to about 2K tokens).
@@ -382,7 +382,7 @@ It's built in plain code by the wrapper node, from the PR overview and `must_rev
 ### Post-processing (in the wrapper node, deterministic)
 - **Hallucination guards:**
   - findings that name a file not in the PR are dropped,
-  - each `evidence` must appear in the diff (compared after normalizing whitespace). If it doesn't, the finding is marked *unverified*, its severity drops one level, and confidence is lowered. The guards set `verified` on every finding. The field is hidden from the schema the model fills (`SkipJsonSchema`), so the model can't claim it.
+  - each `evidence` must appear in the diff (compared after normalizing whitespace). If it doesn't, the finding is marked *unverified*, its severity drops one level, and confidence is lowered. The guards set `verified` on every finding. The field is hidden from the schema the model fills (`SkipJsonSchema`), and any `verified` in the input is dropped, so the model can't claim it. A guard sets it with `model_copy(update={"verified": True})`.
 - **Coverage check:** unread `must_review` files become "verify" focus areas (§3.4). `files_inspected` comes from the agent's state, where `read_file_diff` records each read as it runs.
 
 ### Testing without an API key
@@ -411,7 +411,7 @@ It's built in plain code by the wrapper node, from the PR overview and `must_rev
 1. Every focus area names a changed file.
 2. The risk level is consistent:
    - complex path: it isn't below the highest severity among the *verified* risk findings,
-   - both paths: a secret scan hit requires `high` (§9).
+   - both paths: a secret scan hit requires `high` (§9), except a hit in a test file, where fixtures commonly use fake keys. That hit still routes `complex` and is shown to the model, which judges it.
 3. Required fields are non-empty.
 
 On failure it loops back to synthesize once, passing the errors and the previous draft.
@@ -472,7 +472,9 @@ Each adjustment is written to the trace.
 | Unknown extra fields | Ignored |
 | Unknown `status` | `ChangedFile` keeps the raw value. `parse_pr` maps it into `FileClassification.status` (`removed` → `deleted`), and anything unknown becomes `modified`, with a warning. |
 | Line counts don't match the diff | Trust the diff: the recomputed counts go in `FileClassification`, with a warning |
-| Duplicate paths | Merge and warn |
+| Duplicate paths | Merge and warn. Paths are compared after normalising (`./src/a.py` = `src/a.py`). |
+| Missing or `null` diff | Treated as an empty diff |
+| No `@@` hunk but reported changes (patch missing: an empty diff, e.g. a file too large to diff, or a rename whose content changes were left out) | Not filtered: flag it `is_malformed`, keep the reported counts, route `complex`, cap confidence. Lockfiles and generated/vendored files stay filtered. |
 | Malformed diff (no `@@`, not mechanical, §3.1) | Treat as raw text, flag it (`is_malformed`), keep the reported line counts (the diff can't be counted), route `complex`, cap confidence |
 | `changed_files` empty | Exit 2 |
 | Only mechanical files | Simple path, stated in the review |
@@ -500,14 +502,14 @@ A routing fallback is a **safe default, not a degradation**. The review is still
 |---|---|
 | `architecture_analyst` | `None`; synthesize works from risk findings only |
 | `risk_agent` | `None`; synthesize works from architecture findings only |
-| `synthesize` | **Deterministic fallback review:** risk level `high` on a secret scan hit, `medium` on any core, sensitive, new-module or deleted source file or an injection hit, otherwise `low`. Focus areas = the top-priority files, confidence 0.2, exit 3. |
+| `synthesize` | **Deterministic fallback review:** risk level `high` on a secret scan hit, `medium` on any core, sensitive, new-module or deleted source file or an injection hit, otherwise `low`. A secret hit in a test file counts as `medium`. Focus areas = `must_review`, then the other top-priority files (up to 6), confidence 0.2, exit 3. |
 
 ### Untrusted input
 - **Prompt injection:**
   - PR text goes in delimited data blocks, and the system prompt says it's data, not instructions,
   - a deterministic scan for injection-like phrases forces `complex`, adds a focus area and lowers confidence,
   - `validate` checks the risk level against the findings, which is a second defence.
-- **Secrets:** a regex scan for obvious credentials (`AKIA…`, private key headers, `api_key = "…"`) forces `complex` and a high-severity finding.
+- **Secrets:** a regex scan for obvious credentials (`AKIA…`, private key headers, `api_key = "…"` and annotated forms, hard-coded `os.environ.get(…, "…")` defaults) over added lines, the title and the description forces `complex` and a high-severity finding. camelCase names that end in a keyword (`clientSecret`, `stripeApiKey`, `accessToken`) count too. Names like `tokenizer`, `token_url` or `isSecretValid` don't: only key-like names do.
 
 ### Output
 - Create the parent directory if missing.
