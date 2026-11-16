@@ -127,6 +127,7 @@ class ConfidenceSignals:
     validation_still_failing: bool = False
     core_files: int = 0  # non-filtered core files changed (their callers are unseen)
     unverified_findings: int = 0
+    injection_hits: int = 0  # injection-like phrases found by the scan (§9)
     architecture_degraded: bool = False
     risk_degraded: bool = False
 
@@ -157,6 +158,11 @@ def calibrate_confidence(base: float, signals: ConfidenceSignals) -> tuple[float
                 config.CONF_PENALTY_UNVERIFIED_MAX,
             ),
             f"{signals.unverified_findings} finding(s) couldn't be verified against the diff",
+        ))
+    if signals.injection_hits > 0:
+        penalties.append((
+            config.CONF_PENALTY_INJECTION,
+            "the PR contains injection-like text that may have steered the review",
         ))
     for amount, why in penalties:
         value -= amount
@@ -234,6 +240,7 @@ def confidence_signals(
     revision_count: int,
     validation_errors: Sequence[str],
     degraded: Sequence[str],
+    scan_hits: Sequence[ScanHit],
 ) -> ConfidenceSignals:
     """Map the review's state to the §8 confidence signals.
 
@@ -256,6 +263,7 @@ def confidence_signals(
         validation_still_failing=bool(validation_errors),
         core_files=sum(c.is_core for c in kept),
         unverified_findings=sum(not f.verified for f in risk.findings) if risk is not None else 0,
+        injection_hits=sum(h.kind == "injection" for h in scan_hits),
         architecture_degraded="architecture_analyst" in degraded,
         risk_degraded="risk_agent" in degraded,
     )
@@ -468,7 +476,7 @@ NOT_INSPECTED = "not inspected by the risk agent"  # the per-file suffix and the
 
 
 def split_pr_recommendation(classifications: Mapping[str, FileClassification]) -> str | None:
-    """PR-wide advice to split a PR that is both large AND spread out (§3.4, decided in 3.1).
+    """PR-wide advice to split a PR that is both large AND spread out (§3.4).
 
     Counts non-filtered source files and their modules (distinct parent folders). Both
     counts must exceed their limits. Advice only: it never changes the route or the risk.
@@ -484,6 +492,21 @@ def split_pr_recommendation(classifications: Mapping[str, FileClassification]) -
     return None
 
 
+def injection_warning(scan_hits: Sequence[ScanHit]) -> str | None:
+    """PR-wide warning when the scan found injection-like text (§9).
+
+    The model saw that text, so it may have steered the review: a human should check.
+    Names where it was found (never the text itself), up to ROUTE_REASON_MAX_PATHS places.
+    """
+    places = list(dict.fromkeys(hit_location(h) for h in scan_hits if h.kind == "injection"))
+    if not places:
+        return None
+    shown = ", ".join(places[: config.ROUTE_REASON_MAX_PATHS])
+    extra = len(places) - config.ROUTE_REASON_MAX_PATHS
+    more = f" +{extra} more" if extra > 0 else ""
+    return f"PR-wide: injection-like text in {shown}{more}; check that the review wasn't steered by it"
+
+
 def final_focus_areas(
     areas: Sequence[FocusArea],
     *,
@@ -491,16 +514,18 @@ def final_focus_areas(
     plan: ReviewPlan,
     classifications: Mapping[str, FileClassification],
     files_inspected: Sequence[str],
+    scan_hits: Sequence[ScanHit],
 ) -> tuple[list[str], list[str]]:
     """The output's focus areas as "path: concern" strings, plus trace lines.
 
-    Order: the split-PR advice (if any), then the draft's areas, written with the PR's own
-    path (duplicates removed: same file and concern), then one combined "not inspected" item. Coverage check
-    (complex path only): an unread must_review file the draft names gets a suffix; the
-    unread files it doesn't name are listed together in that one PR-wide item. The PR-wide
-    items have reserved slots, so when the list is over MAX_FOCUS_AREAS, the last draft
-    areas are cut, never an unread file. The combined item names up to 5 files, then
-    "+N more"; the trace names every unread file and counts any cut areas.
+    Order: the injection warning and the split-PR advice (if any), then the draft's areas,
+    written with the PR's own path (duplicates removed: same file and concern), then one
+    combined "not inspected" item. Coverage check (complex path only): an unread
+    must_review file the draft names gets a suffix; the unread files it doesn't name are
+    listed together in that one PR-wide item. The PR-wide items have reserved slots, so
+    when the list is over MAX_FOCUS_AREAS, the last draft areas are cut, never a PR-wide
+    item. The combined item names up to 5 files, then "+N more"; the trace names every
+    unread file and counts any cut areas.
     """
     unread = _unread_must_review(plan, files_inspected) if route.route == "complex" else {}
 
@@ -522,8 +547,8 @@ def final_focus_areas(
         named = {key for key, _ in areas_kept}
         return [path for key, path in unread.items() if key not in named]
 
-    split = split_pr_recommendation(classifications)
-    head = [split] if split is not None else []
+    pr_wide = (injection_warning(scan_hits), split_pr_recommendation(classifications))
+    head = [item for item in pr_wide if item is not None]
     room = config.MAX_FOCUS_AREAS - len(head)
     kept = entries[:room]
     # Reserve a slot for the combined item, then recheck: a draft area cut to make room
@@ -546,5 +571,9 @@ def final_focus_areas(
 
 
 def number_trace(lines: Sequence[str]) -> list[str]:
-    """["Step 1: …", "Step 2: …", …] for the output's reasoning_trace (§8)."""
-    return [f"Step {i}: {line}" for i, line in enumerate(lines, start=1)]
+    """["Step 1: …", "Step 2: …", …] for the output's reasoning_trace (§8).
+
+    Each line is collapsed to one line first: lines can hold model text (focus-area files,
+    validation problems, confidence reasoning), and a newline there could forge a step.
+    """
+    return [f"Step {i}: {' '.join(line.split())}" for i, line in enumerate(lines, start=1)]

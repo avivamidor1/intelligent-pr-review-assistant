@@ -194,6 +194,7 @@ CONF_PENALTY_PER_CORE_FILE: Final = 0.05  # each core file has callers we never 
 CONF_PENALTY_CORE_FILES_MAX: Final = 0.1
 CONF_PENALTY_PER_UNVERIFIED_FINDING: Final = 0.05  # findings the agent couldn't confirm
 CONF_PENALTY_UNVERIFIED_MAX: Final = 0.15
+CONF_PENALTY_INJECTION: Final = 0.1  # injection-like text in the PR: the model may have been steered
 
 # Caps (upper bounds)
 # Coverage: with no must-review file read, the cap is 0.5. With all of them read, it is 1.0,
