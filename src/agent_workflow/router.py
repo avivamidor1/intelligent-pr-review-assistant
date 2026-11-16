@@ -1,7 +1,8 @@
-"""Routing for classify_pr. Phase 2 holds layer 1 only: the hard rules (PLAN.md §3.3).
+"""Routing for classify_pr (PLAN.md §3.3): layer 1 (hard rules) and layer 3 (fallback).
 
-The Jev client (layer 2) comes in Phase 6. The "Jev unavailable → complex" fallback
-(layer 3) is added by the classify_pr node in Phase 3.
+`decide_route` is the single entry point the classify_pr node calls. The Jev client
+(layer 2) comes in Phase 6 and slots in between the rules and the fallback, so the node
+doesn't change.
 """
 
 from __future__ import annotations
@@ -94,3 +95,23 @@ def apply_hard_rules(
 
     # 6. The uncertain middle: small code changes the rules can't classify.
     return None
+
+
+def decide_route(
+    classifications: Mapping[str, FileClassification], stats: PRStats
+) -> RouteDecision:
+    """The full routing decision: the hard rules, else the safe default.
+
+    Without the rules deciding, the PR is in the uncertain middle. Until the Jev client
+    exists (Phase 6), Jev is unavailable there, so the route is complex (§3.3, layer 3).
+    A fallback is a safe default, not a degraded stage.
+    """
+    decision = apply_hard_rules(classifications, stats)
+    if decision is not None:
+        return decision
+    return RouteDecision(route="complex", source="fallback", reason="uncertain middle; Jev unavailable")
+
+
+def describe_route(decision: RouteDecision) -> str:
+    """The trace line for a route decision, e.g. 'Route: complex (rule: core file `a.py`).'"""
+    return f"Route: {decision.route} ({decision.source}: {decision.reason})."

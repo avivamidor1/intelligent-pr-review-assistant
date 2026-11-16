@@ -168,9 +168,9 @@ Every decision goes into the trace with its source:
 There's no separate lane. The complex path scales through the review plan:
 - **The architecture analyst** gets the ranked file list, a deterministic **API-surface extraction** (added or removed top-level `def`, `class` and public names), and full diffs of the top-priority files that fit the budget.
 - **The risk agent** gets `must_review` first in its system prompt, and pulls any other diff on demand.
-- **Coverage check:** after the agent finishes, any `must_review` file it didn't read becomes a *"verify: not inspected"* focus area, and confidence is capped by coverage (§8).
+- **Coverage check:** after the agent finishes, every `must_review` file it didn't read is flagged in the focus areas, and confidence is capped by coverage (§8). `finalize` does this, since the draft exists only after `synthesize`. A focus area the draft already has for that file gets the suffix *"(verify: not inspected by the risk agent)"*. The unread files the draft doesn't name are listed together in **one** PR-wide *"verify: … not inspected"* item, which has a reserved slot, so the limit of 6 can only cut draft items, never an unread file.
 - **The synthesizer's input stays bounded:** at most 15 findings, sorted by severity, plus counts of the rest.
-- **Very large PRs:** above 40 source files or 6 modules, a deterministic focus area recommends splitting the PR.
+- **Very large PRs:** above 40 source files **and** above 6 modules (distinct parent folders), a deterministic focus area recommends splitting the PR. "And", because a small PR spread over many folders (e.g. a rename across packages) is usually fine as one PR.
 
 ### 3.5 Large single files
 `read_file_diff(path, page)` returns the hunk headers plus about 400 lines per page. The agent can request further pages, so nothing is ever cut silently.
@@ -267,6 +267,7 @@ class ReviewState(TypedDict):
     architecture: ArchitectureFindings | None
     risk: RiskFindings | None
     files_inspected: list[str]                     # what the agent actually read
+    risk_budget_exhausted: bool                    # the agent ran out of its tool/model-call budget (§7)
     draft: ReviewDraft | None
     validation_errors: list[str]
     revision_count: int
@@ -303,7 +304,7 @@ class RiskAgentContext:
 The `risk_agent` node in the main graph is a thin wrapper:
 1. it builds the system prompt, the budgets and the agent from the main state,
 2. it invokes the agent with `context=RiskAgentContext(...)`,
-3. it maps only the findings, `files_inspected` and `budget_exhausted` back to the main state.
+3. it maps only the findings, `files_inspected` and `budget_exhausted` (as `risk_budget_exhausted`) back to the main state.
 
 The two states stay independent.
 
@@ -383,7 +384,7 @@ It's built in plain code by the wrapper node, from the PR overview and `must_rev
 - **Hallucination guards:**
   - findings that name a file not in the PR are dropped,
   - each `evidence` must appear in the diff (compared after normalizing whitespace). If it doesn't, the finding is marked *unverified*, its severity drops one level, and confidence is lowered. The guards set `verified` on every finding. The field is hidden from the schema the model fills (`SkipJsonSchema`), and any `verified` in the input is dropped, so the model can't claim it. A guard sets it with `model_copy(update={"verified": True})`.
-- **Coverage check:** unread `must_review` files become "verify" focus areas (§3.4). `files_inspected` comes from the agent's state, where `read_file_diff` records each read as it runs.
+- **Coverage check:** the wrapper only records `files_inspected`, which comes from the agent's state, where `read_file_diff` records each read as it runs. `finalize` turns the unread `must_review` files into focus areas (§3.4), because the draft doesn't exist yet when the wrapper runs.
 
 ### Testing without an API key
 `create_agent` accepts any `BaseChatModel`. A scripted fake chat model returns preset tool calls and a final JSON answer, which exercises the budget stop, the model-call backstop and its recovery call, the error paths and coverage tracking. The fake must accept `bind_tools(..., response_format=...)`. Build it in Phase 5.
@@ -415,6 +416,12 @@ It's built in plain code by the wrapper node, from the PR overview and `must_rev
 3. Required fields are non-empty.
 
 On failure it loops back to synthesize once, passing the errors and the previous draft.
+
+**Still failing after the retry:** `finalize` repairs only what rules can fix, so the output never breaks checks 1–2:
+- the risk level is raised to the minimum the checks require: the highest verified risk finding (complex path), and `high` for a secret hit outside test files. A secret hit in a test file alone still doesn't force `high` (above). The reasoning then starts with a `[Repaired: …]` note, so it doesn't argue for the old level,
+- focus areas that name a file not in the PR are dropped. If none is left, the rule-based focus areas (`must_review` first, as in the fallback review, §9) take their place, so a review always has focus areas.
+
+Each repair is written to the trace (`Repair: …`), and confidence is capped at 0.5 (below). Empty fields aren't repaired. The model's other content is kept: switching to the fallback review (§9) would throw away a whole review over one bad path.
 
 ### `finalize`
 **`complexity_score` (1–10):**
@@ -576,7 +583,7 @@ src/agent_workflow/
   graph.py           # build_graph(): routing, parallel analysts, cycle, RetryPolicy
   observability.py   # optional Langfuse handler (dev only)
   project_context.md # Flask conventions + core path patterns (swappable)
-tests/test_pipeline.py           # one deterministic test module: preprocessing + routing rules + scoring, no API key
+tests/test_pipeline.py           # one test module: the deterministic layer + the graph's two paths (LLM nodes stubbed), no API key
 ```
 
 ---

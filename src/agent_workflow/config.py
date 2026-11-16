@@ -133,6 +133,18 @@ ROUTE_REASON_MAX_PATHS: Final = 5
 # Focus areas in a review (draft and final output). Few enough for a reviewer to act on.
 MAX_FOCUS_AREAS: Final = 6
 
+# validate → synthesize (§8): at most this many revisions of a draft that fails the checks.
+# One retry fixes most slips; a second rarely helps and doubles the cost of a bad case.
+MAX_VALIDATION_RETRIES: Final = 1
+
+# Split-PR advice (§3.4): finalize recommends splitting a PR that is both large and spread
+# out, i.e. MORE than this many non-filtered source files AND MORE than this many modules
+# (distinct parent folders). Like MAX_CODE_FILES, up to the limit is fine. "And", not "or":
+# a small PR across many folders (e.g. a rename across packages) is usually fine as one PR.
+# Advice only; it never changes route or risk.
+SPLIT_PR_MAX_SOURCE_FILES: Final = 40
+SPLIT_PR_MAX_MODULES: Final = 6
+
 # ---------------------------------------------------------------------------
 # Complexity score (§8)
 # clamp(BASE + size + spread + core + new_modules, MIN, MAX), rounded half-up to STEP

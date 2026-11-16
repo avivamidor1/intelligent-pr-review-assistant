@@ -13,7 +13,7 @@ A phase is broken into sub-tasks before we start it, and the sub-tasks are revie
 | 0 | Housekeeping | `.env` is gitignored | ✅ Done |
 | 1 | Setup & schemas | The sample loads and validates, and bad inputs give clear errors | ✅ Done |
 | 2 | Deterministic layer | Preprocessing, routing rules and scoring give correct results on the sample and synthetic PRs | ✅ Done |
-| 3 | Graph skeleton | The graph compiles, prints Mermaid, and both paths run on stubs | — |
+| 3 | Graph skeleton | The graph compiles, prints Mermaid, and both paths run on stubs | ✅ Done |
 | 4 | LLM foundation | First real run on the sample | — |
 | 5 | ReAct risk agent (`create_agent`) | The agent loop works, stops on budget, and recovers from tool errors | — |
 | 6 | Jev router | The uncertain middle is routed with and without `JEV_API_KEY` | — |
@@ -214,10 +214,192 @@ A phase is broken into sub-tasks before we start it, and the sub-tasks are revie
 
 **Out of scope for Phase 2:** graph nodes and wiring (Phase 3), the API-surface extraction (Phase 4, its first consumer), the Jev client (Phase 6), the file reading, size limits and exit codes (Phase 7).
 
-## Phase 3: Graph skeleton
-**Files:** `graph.py`, `nodes.py` (LLM nodes stubbed).
-**Check:** it compiles, prints Mermaid, and both paths run end to end on stubs.
-*Sub-tasks: to be written when the phase starts.*
+## Phase 3: Graph skeleton ✅
+
+**Goal:** the full 7-node graph from PLAN.md §2 is wired and runs end to end, with no API key. The deterministic nodes (`parse_pr`, `classify_pr`, `validate`, `finalize`) are real. The three LLM nodes (`architecture_analyst`, `risk_agent`, `synthesize`) are **stubs** that return fixed, schema-valid results. Phases 4–5 replace only the stub bodies; the wiring, the state and the deterministic nodes stay as they are.
+**Files:** `src/agent_workflow/nodes.py` (new), `src/agent_workflow/graph.py` (new), `config.py`, `router.py`, `scoring.py`, `state.py` (3.2), `tests/test_pipeline.py` (3.9), `docs/PLAN.md` (3.10).
+**Design references:** PLAN.md §2 (graph, LangGraph features), §3.3 (route trace lines), §3.4 (coverage check, split-PR focus area), §6 (state), §8 (`validate`, `finalize`), §13 (file layout).
+**Conventions:**
+- A node takes `state: ReviewState` and returns a partial-update `dict`. Nodes only call the Phase 2 functions and the helpers below, so every decision stays a pure, testable function outside the graph.
+- Trace lines are plain sentences with no numbering; `finalize` numbers them. No trace line holds matched secret text (Phase 2 already keeps it out of every derived object).
+- `degraded` entries are node names (`"architecture_analyst"`, `"risk_agent"`, `"synthesize"`). Phase 7 writes them; `finalize` already reads them.
+
+**Checked before writing these sub-tasks** (langgraph 1.2.19, a scratch probe outside the repo):
+- a conditional edge that returns a list (`["architecture_analyst", "risk_agent"]`) fans out to both analysts,
+- `add_edge(["architecture_analyst", "risk_agent"], "synthesize")` runs `synthesize` once, after both,
+- the `validate → synthesize` retry edge doesn't re-trigger that join,
+- `get_graph().draw_mermaid()` draws every edge, with the conditional ones dashed.
+
+### Sub-tasks
+
+- [x] **3.0 Pre-phase review (your workflow)**: *skipped (decision)*
+  - Run the code-review and code-simplifier plugins on the current code (Phase 2, `7215260`), apply the validated findings, and confirm `uv run pytest -q` still passes.
+  - *Decision:* skipped. The Phase 2 code already went through a code review and a quality review before it was merged (see "Decision changed (code review)" and "(Phase 2 quality review)" in Phase 2), and nothing has changed since. The review runs again before Phase 4, on the Phase 3 code.
+
+- [x] **3.1 `config.py`: the constants this phase uses**
+  - `MAX_VALIDATION_RETRIES = 1` (§8: "at most 1 retry").
+  - `SPLIT_PR_MAX_SOURCE_FILES = 40` and `SPLIT_PR_MAX_MODULES = 6`. Both are strict `>`, and **both** must be exceeded.
+    - *Changed (pre-3.5 code review):* first named `SPLIT_PR_MIN_*`, which reads as "at least". Renamed to `MAX`, matching `MAX_CODE_FILES = 3` ("more than 3 → complex").
+    - *Decision changed:* PLAN.md §3.4 said "above 40 source files **or** 6 modules". With "or", a small PR spread over 7 folders (e.g. a rename across packages) would get "consider splitting", so it's now **"and"**: only a PR that is both large and spread out gets the advice. PLAN.md §3.4 is updated.
+  - *Done when:* each number appears exactly once and is imported where it's used.
+
+- [x] **3.2 `state.py`: `risk_budget_exhausted` (a plan discrepancy, approved)**
+  - **The issue:** PLAN.md §6 says the risk wrapper maps `budget_exhausted` back to the main state, and §8 caps confidence on it ("Agent hit its limit"), but `ReviewState` has no field to hold it.
+  - **Proposed:** add `risk_budget_exhausted: bool` to `ReviewState`. `parse_pr` sets it to `False`, the risk stub returns `False`, and Phase 5 sets the real value. PLAN.md §6's state block is updated to match (3.10), which fixes an internal inconsistency rather than changing the design.
+  - *Rejected alternative:* a hidden system field on `RiskFindings` (like `verified`). It mixes run metadata into the findings model the LLM fills.
+
+- [x] **3.3 `router.py`: the full routing decision and its trace line**
+  - `decide_route(classifications: Mapping[str, FileClassification], stats: PRStats) -> RouteDecision`:
+    - returns `apply_hard_rules(...)` when the rules decide,
+    - otherwise (the uncertain middle) `RouteDecision(route="complex", source="fallback", reason="uncertain middle; Jev unavailable")`.
+    - Phase 6 inserts the Jev call between these two steps, so the `classify_pr` node never changes.
+  - `describe_route(decision: RouteDecision) -> str`, in the §3.3 format:
+    - `"Route: complex (rule: core file `src/flask/app.py`; new module `src/flask/rate_limiter.py`; size: 151 changed code lines > 50)."`
+    - `"Route: simple (rule: only docs and/or mechanical files (2 docs, 0 mechanical))."`
+    - `"Route: complex (fallback: uncertain middle; Jev unavailable)."`
+    - The Jev form, `"Route: simple (Jev, p=0.93): …"`, is added in Phase 6.
+
+- [x] **3.4 `scoring.py`: the pure helpers `finalize` needs**
+  - `_unread_must_review(plan, files_inspected) -> dict[str, str]` (normalised path → path as written, in `must_review` order): the single definition of "read", shared by the two functions below so the coverage cap and the focus areas can't disagree. *Added in the pre-3.5 code review.*
+  - `must_review_coverage(plan: ReviewPlan, files_inspected: Sequence[str]) -> float | None`: the share of `must_review` files (normalised paths) found in `files_inspected`. `None` when `must_review` is empty (e.g. a complex route caused only by a title/description scan hit), so there is no coverage cap.
+  - `confidence_signals(*, route, plan, classifications, architecture, risk, files_inspected, risk_budget_exhausted, revision_count, validation_errors, degraded) -> ConfidenceSignals`, mapping the state to the §8 signals:
+
+    | Signal | Value |
+    |---|---|
+    | `must_review_coverage` | `must_review_coverage(...)` on the complex path, `None` on the simple path |
+    | `truncated` | any non-filtered file `is_malformed`. Phase 4 adds "the architecture diff budget cut files". |
+    | `disagreement_levels` | `abs(LEVEL_ORDER[impact_level] − LEVEL_ORDER[max_severity])` when both analysts returned results and `risk.max_severity` isn't `None`; otherwise `None` |
+    | `agent_hit_limit` | `risk_budget_exhausted` |
+    | `validation_retried` | `revision_count > 0` |
+    | `validation_still_failing` | `bool(validation_errors)` (the last `validate` result) |
+    | `core_files` | non-filtered `is_core` files |
+    | `unverified_findings` | risk findings with `verified == False` (0 when `risk` is `None`). Until Phase 5 adds the guards, every finding counts as unverified, which is the conservative default. |
+    | `architecture_degraded` / `risk_degraded` | `"architecture_analyst"` / `"risk_agent"` in `degraded` |
+
+  - `split_pr_recommendation(classifications) -> str | None`: counts the non-filtered source files and their modules, where a module is a distinct parent directory (`posixpath.dirname` of the normalised path). If **both** counts are over their limits (3.1), it returns `"PR-wide: {n} source files across {m} modules; consider splitting it into smaller PRs"`.
+  - `final_focus_areas(draft: ReviewDraft, *, route: RouteDecision, plan: ReviewPlan, classifications, files_inspected) -> tuple[list[str], list[str]]` returns (focus strings, trace lines):
+    1. the split-PR recommendation first, if there is one (PR-level and the most actionable item for a huge PR),
+    2. then the draft's focus areas, in order, as `"{file}: {concern}"`,
+    3. **coverage check (complex path only):** for the `must_review` files not in `files_inspected`:
+       - an unread file the draft already names gets the suffix `" (verify: not inspected by the risk agent)"` on that item,
+       - the unread files the draft doesn't name are listed together in **one** item at the end: `"PR-wide: verify: must-review files `a`, `b` +N more not inspected by the risk agent"`,
+    4. the draft's exact duplicates are removed. The PR-wide items (split advice, combined "not inspected") have reserved slots, so when the total is over `MAX_FOCUS_AREAS` (6), the **last draft items** are cut.
+    - Trace lines: one listing every unread `must_review` file (via `describe_paths`), and one with the number of draft items cut by the limit, so nothing is dropped silently.
+    - *Decision changed (pre-3.5 code review):* the first version added one "not inspected" item per file *after* the draft's items and then cut to 6, so unread files could disappear from the focus areas (PLAN.md §3.4 says each one is flagged). One combined item with a reserved slot always fits. The slot is reserved before deciding which unread files the draft "names", so a draft area cut to make room can't take the only mention of an unread file with it (checked with a regression case).
+  - `number_trace(lines: Sequence[str]) -> list[str]`: `["Step 1: …", "Step 2: …", …]`.
+
+- [x] **3.5 `nodes.py`: the four deterministic nodes**
+  - `parse_pr(state) -> dict`:
+    - `PRInput.model_validate(state["raw_pr"])`. A `ValidationError` propagates; the CLI validates first and exits 2 (Phase 7).
+    - It reads `config.PROJECT_CONTEXT_PATH` and calls `load_core_patterns`, then `preprocess`.
+    - *Decision:* a missing `project_context.md` raises, with no silent `[]`. Losing the core patterns would silently weaken routing (fewer `complex` routes), and the file ships with the package.
+    - Returns `pr`, `classifications`, `stats` and `plan`, and initialises `architecture=None`, `risk=None`, `files_inspected=[]`, `draft=None`, `validation_errors=[]`, `revision_count=0` and `risk_budget_exhausted=False`, so later nodes never hit a missing key.
+    - Trace: every `notes` entry, then
+      - `"Parsed {files_total} file(s): {code_files} code ({source_files} source), {filtered_files} mechanical skipped; {code_lines_changed} changed code lines; ~{estimated_tokens} tokens."`
+      - `"Review plan: must-review {describe_paths('file', must_review)}; tool budget {max_tool_calls} calls; architecture diff budget {architecture_diff_budget_tokens} tokens."` (or `"must-review: none"`).
+  - `classify_pr(state) -> dict`: `{"route": decide_route(...), "reasoning_trace": [describe_route(route)]}`.
+  - `validate(state) -> dict`:
+    - `problems = check_draft(state["draft"], classifications=…, route=…, risk=…, scan_hits=state["stats"].scan_hits)`,
+    - returns `validation_errors=problems` and a trace line, `"Validation passed."` or `"Validation failed: {p1}; {p2}."`.
+  - `finalize(state) -> dict`:
+    1. if `draft` is `None`, it raises `RuntimeError` (Phase 7 replaces this with the fallback review),
+    2. `complexity_score(classifications)`,
+    3. `confidence_signals(...)`, then `calibrate_confidence(draft.confidence, signals)`,
+    4. `final_focus_areas(...)`,
+    5. it appends its own trace lines: `"Model confidence {x:.2f}: {confidence_reasoning}"`, the calibration lines, `"Confidence: {final:.2f}."`, `"Complexity score: {score}."`, the focus-area lines, and, if validation is still failing, `"Validation still failing after {revision_count} retry: …"`,
+    6. it returns `{"output": ReviewOutput(...)}`, with `reasoning_trace=number_trace(state["reasoning_trace"] + its own lines)`.
+
+- [x] **3.6 `nodes.py`: the three LLM stubs**
+  - Each body is marked `# STUB: replaced in Phase 4` (or 5) and makes no network call.
+  - `architecture_analyst`: `ArchitectureFindings(impact_level="low", summary="Stub: not analysed (no LLM until Phase 4).", findings=[])`, with the trace line `"Architecture analyst: stub, no LLM call."`.
+  - `risk_agent`: `risk=RiskFindings(findings=[])`, `files_inspected=[]` (honest: nothing was read, so the coverage cap applies), `risk_budget_exhausted=False`, with the trace line `"Risk agent: stub, no tools run."`.
+  - `synthesize`, the same stub on both paths:
+    - the draft is `fallback_review(classifications, plan, stats)` with `confidence=0.8` and `confidence_reasoning="Stub draft (no LLM until Phase 4)."`. A stub-only constant in `nodes.py`, not `config.py`.
+    - 0.8 rather than the fallback's 0.2, so the calibration's penalties and caps show up visibly on the stub runs.
+    - **Not a stub (kept in Phase 4):** if `validation_errors` is non-empty, this run is a revision: `revision_count += 1`, and the trace says `"Synthesize: revision {n} with the validator's feedback."`.
+  - The `validate` → retry edge (3.7) is `"synthesize" if validation_errors and revision_count < MAX_VALIDATION_RETRIES else "finalize"`. With the limit at 1, synthesize runs at most twice.
+
+- [x] **3.7 `graph.py`: `build_graph()`**
+  - `build_graph() -> CompiledStateGraph`: `StateGraph(ReviewState, input_schema=GraphInput, output_schema=GraphOutput)`.
+  - It looks up each node as `nodes.<name>` when it builds the graph, so a check or test can swap an LLM node by patching the `nodes` module.
+  - Edges:
+    - `START → parse_pr → classify_pr`,
+    - `classify_pr` → `after_classify(state)`, which returns `"synthesize"` or `["architecture_analyst", "risk_agent"]`; path map `["synthesize", "architecture_analyst", "risk_agent"]`,
+    - `add_edge(["architecture_analyst", "risk_agent"], "synthesize")`, the join,
+    - `synthesize → validate`,
+    - `validate` → `after_validate(state)` (3.6); path map `["synthesize", "finalize"]`,
+    - `finalize → END`.
+  - It compiles with **no checkpointer** (§11).
+  - `python -m agent_workflow.graph` prints the Mermaid diagram.
+  - *Deferred to Phase 4:* `RetryPolicy` on the LLM nodes. Which exception structured output raises on a schema mismatch must be checked first; retrying on a guessed type would retry nothing, or retry 400s.
+
+- [x] **3.8 Phase check (ad hoc, no API key)**
+  - *Result:* every row below passed on the real graph (`build_graph().invoke`), with network connections blocked and each node call counted. LangGraph's debug stream shows both analysts in step 3 and `synthesize` alone in step 4.
+  - `uv run python -m agent_workflow.graph` prints Mermaid with all 7 nodes, the dashed fan-out and the dashed retry edge.
+  - `build_graph().invoke({"raw_pr": …})` returns only `{"output": ReviewOutput}`:
+
+    | PR | Expected |
+    |---|---|
+    | The sample `pr_input.json` | `Route: complex (rule: core file …; new module …; size: 151 changed code lines > 50)`; both stubs run once and `synthesize` runs once; `risk_level` `medium`; 3 focus areas, each with the "not inspected" suffix; complexity 5.5; confidence 0.8 − 0.05 (core) = 0.75 → capped at 0.50 (coverage 0%) |
+    | Docs only (`README.md`, `docs/config.rst`) | `Route: simple (rule: …)`; neither analyst runs; `risk_level` `low`; 2 focus areas, no suffix; complexity 1.0; confidence 0.80 |
+    | One-line comment fix in `src/flask/debughelpers.py` | `Route: complex (fallback: uncertain middle; Jev unavailable)`; source `fallback` |
+    | A secret in `README.md` | complex (rule); `risk_level` `high`; validation passes; the secret text is absent from the whole output |
+    | Sample, with `nodes.synthesize` patched to name a file not in the PR | `synthesize` runs twice, `"Validation failed"` appears twice, `revision_count` 1, confidence ≤ 0.50 ("still fails validation") |
+
+  - Every trace line starts with `Step N:`, numbered from 1 with no gaps.
+  - The relative order of the two analysts' trace lines isn't asserted (they run in the same step).
+
+- [x] **3.9 Test (approved: the graph test)**
+  - Add one small function, `test_graph_paths`, to the existing `tests/test_pipeline.py`. It's parametrized over the docs-only PR (simple) and the sample (complex), and asserts the route line, that the output validates and the `Step N:` numbering. It needs no API key. From Phase 4 on, it patches the three LLM nodes with stubs (possible because of 3.7's lookup).
+  - *Rejected alternative:* keep Phase 2's "one test" scope, and run the graph checks ad hoc only (3.8).
+  - *Why:* AGENTS.md puts graph routing first among what to test, and it's about 20 lines in the same single module, so it stays within "one simple test is fine".
+
+- [x] **3.10 Docs and wrap-up**
+  - *Done early (pre-3.5 code review), so the plan matches the code now:* PLAN.md §6 lists `risk_budget_exhausted` (3.2); §3.4 says "and" (3.1) and describes the combined "not inspected" item (3.4); §7, "Coverage check": state that the wrapper only records `files_inspected`, and that `finalize` turns unread `must_review` files into focus areas (3.4). The wrapper runs before the draft exists, so it can't add focus areas itself. *Approved.*
+  - PLAN.md §3.4, "Very large PRs": "above 40 source files **and** 6 modules" (3.1).
+  - PLAN.md §13: the test module now covers the graph's two paths too (3.9).
+  - Tick the sub-tasks here, and set the Phase 3 status in the overview.
+  - `uv run pytest -q` passes, `py_compile` is clean, and `git diff` is inspected. Report the 3.8 results, then stop for review.
+
+### Review pass after Phase 3 (code-review + code-simplifier) ✅
+Both ran on the whole Phase 3 diff. Validated findings applied; the rest were left unchanged with a reason.
+- **Applied, code review:**
+  - **#1:** the "Not inspected" trace line now names **every** unread `must_review` file. The combined focus item keeps the 5-name cap ("+N more") to stay readable.
+  - **#3:** focus-area duplicates are found by (normalised file, concern), so `./src/a.py: X` and `src/a.py: X` are one item (the first spelling is kept).
+  - **#2, option A:** a draft still failing after its retry is **repaired** in `finalize` by `scoring.repair_draft`:
+    - the risk level is raised to the minimum the checks require (the highest verified finding, or `high` for a secret hit outside test files; the 2.7 test-file exception holds),
+    - focus areas on files not in the PR are dropped,
+    - each repair goes to the trace, and the confidence cap of 0.5 applies.
+    - `check_draft` and `repair_draft` share the rule helpers (`_changed_paths`, `_highest_verified`, `_forcing_secret_hits`), so they can't drift. `final_focus_areas` now takes the (repaired) focus areas instead of the draft. PLAN.md §8 is updated.
+- **Applied, code-simplifier (all 9):** clearer names and lines in `final_focus_areas` and `split_pr_recommendation`; `# STUB:` comments on all three stub bodies; an accurate state-initialisation comment; `files_inspected` read once in `finalize`; stricter, split assertions in `test_graph_paths`.
+- **Test:** one compact regression test, `test_repair_failed_draft` (3 cases: secret outside tests → `high`; secret only in a test file → not forced; a focus area on a file not in the PR → dropped).
+- **Not changed, with reasons:**
+  - **#4:** a scan-hit file that is filtered still counts for coverage, because the agent should read it. *Phase 5 note:* `read_file_diff` must allow filtered files that are in `must_review`.
+  - **#5:** `split_pr_recommendation` needs the paths anyway; a root-level file is a real location.
+  - **#6:** the graph test's two runs are needed, since `values` mode returns the full internal state, not the `{output}` schema.
+  - **#7:** both coverage computations use the same `normalize_path`.
+  - **#8:** reading `project_context.md` once per CLI run is intended.
+
+### Final review pass before commit (code-review + code-simplifier) ✅
+- **Applied, code review:**
+  - **#1:** if the repair drops every focus area, the rule-based focus areas take their place (with a `Repair:` trace line), so the output is never empty.
+  - **#2:** `test_graph_paths` has a third case: `synthesize` is patched to name a file not in the PR, so the draft fails twice. It asserts 2 synthesize/validate runs, a `Repair:` line, confidence ≤ 0.5, and that the bad file is gone. Fault injection: `<=` in `after_validate`, a skipped retry, and a missing `revision_count` increment are all caught.
+  - **#4:** a raised risk level prefixes the reasoning with `[Repaired: risk level raised from 'x' to 'y': …]`.
+  - **#5:** focus areas are written with the PR's own path, not the model's spelling (`./src/a.py`).
+  - **#6:** the model's confidence reasoning is collapsed to one line in the trace, so it can't break the `Step N:` format.
+  - **#7:** one constant, `NOT_INSPECTED`, for the per-file suffix and the combined item (the output strings are unchanged).
+  - **#8:** `repair_draft` splits kept and dropped focus areas in one loop. It now returns the repaired `ReviewDraft` plus its trace lines.
+- **Applied, code-simplifier:** that same `repair_draft` loop, and a `kept` column in `test_repair_failed_draft`.
+- **Not changed:**
+  - **#3:** a negative slice only when `MAX_FOCUS_AREAS` is 1, but it's 6. The reserved slots need at least 2 anyway.
+  - **#9:** coverage normalising `must_review` twice; same reason as the earlier #7.
+
+**Out of scope for Phase 3:**
+- real LLM calls, `RetryPolicy` and usage accounting (Phase 4),
+- the agent itself, the hallucination guards and real `files_inspected` (Phase 5),
+- the Jev client (Phase 6),
+- the per-node degradation fallbacks (e.g. synthesize failing → `fallback_review` + `degraded`), reading the input file, exit codes and the CLI (Phase 7),
+- Langfuse (Phase 8).
 
 ## Phase 4: LLM foundation
 **Files:** `llm.py`, `prompts.py`, the API-surface extraction in `preprocessing.py` (§3.4), `architecture_analyst`, `synthesize` (both modes).

@@ -32,6 +32,7 @@ class ReviewState(TypedDict):
     architecture: ArchitectureFindings | None
     risk: RiskFindings | None
     files_inspected: list[str]  # what the agent actually read
+    risk_budget_exhausted: bool  # risk agent ran out of its tool/model-call budget (§7); caps confidence (§8)
     draft: ReviewDraft | None
     validation_errors: list[str]
     revision_count: int
