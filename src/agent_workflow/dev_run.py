@@ -15,7 +15,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 from .graph import build_graph
-from .observability import langfuse_enabled, traced_run
+from .observability import traced_run
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -26,9 +26,10 @@ def main(argv: list[str] | None = None) -> None:
 
     with traced_run("pr-review", metadata={"pr_file": path.name}) as config:
         result = build_graph().invoke({"raw_pr": raw_pr}, config=config)
+        traced = bool(config.get("callbacks"))  # what actually happened, not just the keys
 
     print(result["output"].model_dump_json(indent=2))
-    print(f"Langfuse tracing: {'on' if langfuse_enabled() else 'off'}", file=sys.stderr)
+    print(f"Langfuse tracing: {'on' if traced else 'off'}", file=sys.stderr)
 
 
 if __name__ == "__main__":

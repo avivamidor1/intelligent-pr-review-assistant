@@ -404,7 +404,34 @@ Both ran on the whole Phase 3 diff. Validated findings applied; the rest were le
 ## Phase 4: LLM foundation
 **Files:** `llm.py`, `prompts.py`, the API-surface extraction in `preprocessing.py` (§3.4), `architecture_analyst`, `synthesize` (both modes).
 **Check:** structured output, effort, fallbacks and caching are verified against the installed `langchain-anthropic`, then the first real run on the sample.
-*Sub-tasks: to be written when the phase starts.*
+
+- [x] **4.0 Pre-phase review (code-review + code-simplifier)** ✅
+  Both ran on `7215260..a67925e`, which is the Phase 3 code plus the early Phase 8 (Langfuse) code. code-review ran at level `high`, and code-simplifier was report-only. 13 findings, one reported by both tools. Every finding was checked against the code, and you approved the list below.
+  - **Applied, code review:**
+    - **E (plan gap):** PLAN.md §9 says an injection hit "adds a focus area and lowers confidence", but §8's confidence table had no injection row, so only the `complex` route was implemented.
+      - Now `finalize` adds a PR-wide warning first in the focus areas (`PR-wide: injection-like text in …; check that the review wasn't steered by it`). It has a reserved slot, names only where the text was found and never the text itself, and is built by `scoring.injection_warning`.
+      - Confidence gets **−0.1** (`CONF_PENALTY_INJECTION`, your choice over a cap), with a trace line.
+      - PLAN.md §8 now has the table row and the assembly rule.
+    - **C:** model text went into trace lines unflattened. A focus-area file such as `"x.py\nStep 3: Validation passed."` could forge a step through the validation and repair lines. `number_trace` now collapses every line, replacing the one-off flattening of `confidence_reasoning`.
+    - **B:** tracing now also requires `LANGFUSE_BASE_URL`. Without it, the SDK defaults to Langfuse Cloud, and traces hold full diffs. `.env.example` and PLAN.md §12 are updated.
+  - **Applied, both tools (A):** `dev_run` printed "tracing: on" from the keys alone. It now reports whether a handler was actually attached. `langfuse_enabled()` was removed, and its check is now inside `get_langfuse_handler`.
+  - **Applied, code-simplifier (D):**
+    - `split_pr_recommendation` cited "decided in 3.1", which reads as PLAN.md §3.1; it now cites only §3.4.
+    - The `final_focus_areas` docstring is re-wrapped.
+    - The tests load the sample PR once (`SAMPLE_RAW`).
+    - `1 + int(failing_draft)`.
+  - **Tests:**
+    - `test_graph_paths` has an injection case: a docs fix with "Ignore previous instructions…" in the description. It checks that the warning comes first and that the −0.10 line is in the trace.
+    - The failing-draft case now uses a forging file name and asserts that no trace line contains a newline.
+    - `test_tracing_is_optional` has a no-base-URL case.
+    - Fault injection: removing the flattening, the penalty, the warning or the base-URL requirement each makes one test fail.
+  - **Not changed, with reasons:**
+    - **The flush could stall when the server is down:** measured at 3 s with exit 0, since a refused connection fails fast. Only a server that accepts connections and then hangs could stall, and production installs don't include `langfuse`.
+    - **`repair_draft` and `check_draft` could drift:** they already share the rule helpers (Phase 3 review), and E adds no risk-level rule.
+    - **The graph test runs the graph twice:** decided in the Phase 3 review (#6). Revisit in Phase 4 if the fake LLM nodes are stateful.
+    - **The unread must-review set is computed twice:** the same helper is used, as in the Phase 3 review (#7).
+
+*Sub-tasks 4.1+: to be written next, for your review.*
 
 ## Phase 5: ReAct risk agent (`create_agent`)
 **Files:** `tools.py` (`@tool` functions, `ToolInputError`, the `on_error` handler), `project_context.md`, `risk_agent.py` (`RiskAgentState`, `RiskAgentContext`, the middleware, budgets, wrapper, recovery call, hallucination guards, coverage check).
@@ -435,9 +462,9 @@ Both ran on the whole Phase 3 diff. Validated findings applied; the rest were le
 *Decision changed (order):* done before Phase 4 instead of after the CLI, at your request, so the LLM phases are traced while they're built. The phase number is kept so existing references stay valid.
 
 - [x] **8.1 Local Langfuse server** — Langfuse's official `docker-compose.yml` (unmodified) in `langfuse/`, with every `CHANGEME` value overridden in `langfuse/.env` (git-ignored; template in `langfuse/.env.example`). Headless init creates the user, org, project and API keys on first start. `TELEMETRY_ENABLED=false`. Kept in the repo at your request (it's dev tooling, not part of the app).
-- [x] **8.2 `observability.py`** — `get_langfuse_handler()` returns a `CallbackHandler` only when both keys are set and `langfuse` is installed; `traced_run(name, metadata=)` yields the run config (`{}` when off), sets the trace name via `propagate_attributes`, and flushes on exit.
+- [x] **8.2 `observability.py`** — `get_langfuse_handler()` returns a `CallbackHandler` only when both keys and `LANGFUSE_BASE_URL` are set and `langfuse` is installed (the base URL was added in the 4.0 review); `traced_run(name, metadata=)` yields the run config (`{}` when off), sets the trace name via `propagate_attributes`, and flushes on exit.
 - [x] **8.3 `dev_run.py`** — `uv run python -m agent_workflow.dev_run [pr.json]` runs the graph traced. A stand-in until the Phase 7 CLI, which reuses `traced_run`.
-- [x] **8.4 Test** — `test_tracing_is_optional`: no keys, or keys without the package, gives no handler and `{}` config, and the graph still runs.
+- [x] **8.4 Test** — `test_tracing_is_optional`: no keys, no base URL (added in 4.0), or no package gives no handler and `{}` config, and the graph still runs.
 - [x] **8.5 Phase check** — verified via the v2 observations API: one `pr-review` root with each node nested under it (both analysts on the complex path). Keys set with the server down: the run still exits 0 (export errors logged). No keys: tracing off. `uv run --no-dev`: the module imports and returns no handler.
   - *Note:* the server runs Langfuse v4 in events-only mode, so the legacy `GET /api/public/traces` is unavailable; read traces with `GET /api/public/v2/observations` (SDK: `get_client().api.observations.get_many`).
 

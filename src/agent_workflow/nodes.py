@@ -163,7 +163,7 @@ def finalize(state: ReviewState) -> dict[str, Any]:
     draft = _require_draft(state, "finalize")
     classifications, route, plan = state["classifications"], state["route"], state["plan"]
     revisions, errors = state["revision_count"], state["validation_errors"]
-    files_inspected = state["files_inspected"]
+    files_inspected, scan_hits = state["files_inspected"], state["stats"].scan_hits
 
     score = complexity_score(classifications)
     signals = confidence_signals(
@@ -177,6 +177,7 @@ def finalize(state: ReviewState) -> dict[str, Any]:
         revision_count=revisions,
         validation_errors=errors,
         degraded=state["degraded"],
+        scan_hits=scan_hits,
     )
     confidence, confidence_lines = calibrate_confidence(draft.confidence, signals)
     # A no-op unless the draft still fails validation after its retry (§8).
@@ -186,7 +187,7 @@ def finalize(state: ReviewState) -> dict[str, Any]:
         route=route,
         plan=plan,
         risk=state["risk"],
-        scan_hits=state["stats"].scan_hits,
+        scan_hits=scan_hits,
     )
     focus, focus_lines = final_focus_areas(
         repaired.review_focus_areas,
@@ -194,12 +195,12 @@ def finalize(state: ReviewState) -> dict[str, Any]:
         plan=plan,
         classifications=classifications,
         files_inspected=files_inspected,
+        scan_hits=scan_hits,
     )
 
-    # Model text on one line, so it can't break the numbered `Step N:` trace.
-    model_reasoning = " ".join(draft.confidence_reasoning.split())
+    # number_trace collapses each line, so model text can't break the `Step N:` format.
     lines = [
-        f"Model confidence {draft.confidence:.2f}: {model_reasoning}",
+        f"Model confidence {draft.confidence:.2f}: {draft.confidence_reasoning}",
         *confidence_lines,
         f"Confidence: {confidence:.2f}.",
         f"Complexity score: {score}.",

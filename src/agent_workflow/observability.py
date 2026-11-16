@@ -1,8 +1,10 @@
 """Optional Langfuse tracing, for development only (docs/PLAN.md §12).
 
-Tracing is on only when both LANGFUSE_PUBLIC_KEY and LANGFUSE_SECRET_KEY are set and the
-`langfuse` package (the `dev` dependency group) is installed. Otherwise every function here
-is a no-op and the app runs exactly as without it. Langfuse is never required.
+Tracing is on only when LANGFUSE_PUBLIC_KEY, LANGFUSE_SECRET_KEY and LANGFUSE_BASE_URL are
+all set and the `langfuse` package (the `dev` dependency group) is installed. Otherwise
+every function here is a no-op and the app runs exactly as without it. Langfuse is never
+required. The base URL must be explicit: without it the SDK defaults to Langfuse Cloud, and
+traces hold full PR diffs that should stay on this machine.
 
 One graph run gives one nested trace: each node is a span, and every LangChain call made
 inside a node (Claude calls, the risk agent's tool calls) nests under it, because LangChain
@@ -21,13 +23,12 @@ from typing import Any
 from langchain_core.runnables import RunnableConfig
 
 
-def langfuse_enabled() -> bool:
-    return bool(os.getenv("LANGFUSE_PUBLIC_KEY") and os.getenv("LANGFUSE_SECRET_KEY"))
+_REQUIRED_ENV = ("LANGFUSE_PUBLIC_KEY", "LANGFUSE_SECRET_KEY", "LANGFUSE_BASE_URL")
 
 
 def get_langfuse_handler() -> Any | None:
     """Langfuse's LangChain CallbackHandler, or None when tracing is off."""
-    if not langfuse_enabled():
+    if not all(os.getenv(name) for name in _REQUIRED_ENV):
         return None
     try:
         from langfuse.langchain import CallbackHandler

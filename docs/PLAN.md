@@ -447,13 +447,14 @@ Each term is clamped to `[0, max]`, and rounding is half-up. Example: the sample
 | Validation retry | −0.05; still failing: cap at 0.5 |
 | Core files modified (callers unseen) | −0.05 each, max −0.1 |
 | Unverified findings | −0.05 each, max −0.15 |
+| Injection scan hit (§9) | −0.1 |
 | Degraded stage: architecture / risk | cap at 0.5 / 0.4 |
 
 Each adjustment is written to the trace.
 
 **Assembly:**
-- focus areas become `"path: concern"` strings, deduplicated, at most 6,
-- the trace is numbered `Step N: ...` and includes the route decision,
+- focus areas become `"path: concern"` strings, deduplicated, at most 6. An injection scan hit adds a PR-wide warning first (`PR-wide: injection-like text in …; check that the review wasn't steered by it`), which has a reserved slot, like the split-PR advice,
+- the trace is numbered `Step N: ...` and includes the route decision. Each line is collapsed to one line, so model text can't forge a step,
 - the result is validated as a `ReviewOutput`.
 
 ---
@@ -555,7 +556,7 @@ A routing fallback is a **safe default, not a degradation**. The review is still
 ---
 
 ## 12. Langfuse (development only, not submitted)
-`observability.py` returns a `CallbackHandler` only if the keys are set and the package is installed. The handler is passed in the graph config, giving one nested trace per run: the route decision, the analysts in parallel, the agent's tool calls and the validate loop. There are no scores or experiments.
+`observability.py` returns a `CallbackHandler` only if both keys and `LANGFUSE_BASE_URL` are set and the package is installed. The base URL must be explicit, because the SDK's default is Langfuse Cloud. The handler is passed in the graph config, giving one nested trace per run: the route decision, the analysts in parallel, the agent's tool calls and the validate loop. There are no scores or experiments.
 
 The server is self-hosted locally: `langfuse/` holds Langfuse's official `docker-compose.yml` (unmodified) and a `.env.example` for its secrets, so no trace data leaves the machine. `traced_run()` wraps a run: it sets the trace name and flushes on exit, since a short-lived process would otherwise exit before the spans are sent. Until the CLI exists (Phase 7), `dev_run.py` runs the graph on a PR file with tracing.
 
