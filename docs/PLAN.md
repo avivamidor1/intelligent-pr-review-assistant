@@ -557,6 +557,8 @@ A routing fallback is a **safe default, not a degradation**. The review is still
 ## 12. Langfuse (development only, not submitted)
 `observability.py` returns a `CallbackHandler` only if the keys are set and the package is installed. The handler is passed in the graph config, giving one nested trace per run: the route decision, the analysts in parallel, the agent's tool calls and the validate loop. There are no scores or experiments.
 
+The server is self-hosted locally: `langfuse/` holds Langfuse's official `docker-compose.yml` (unmodified) and a `.env.example` for its secrets, so no trace data leaves the machine. `traced_run()` wraps a run: it sets the trace name and flushes on exit, since a short-lived process would otherwise exit before the spans are sent. Until the CLI exists (Phase 7), `dev_run.py` runs the graph on a PR file with tracing.
+
 ---
 
 ## 13. File layout
@@ -581,8 +583,10 @@ src/agent_workflow/
   risk_agent.py      # create_agent config: RiskAgentState, RiskAgentContext, middleware, budgets, wrapper, recovery call, guards
   nodes.py           # graph nodes
   graph.py           # build_graph(): routing, parallel analysts, cycle, RetryPolicy
-  observability.py   # optional Langfuse handler (dev only)
+  observability.py   # optional Langfuse handler + traced_run (dev only)
+  dev_run.py         # dev runner: graph on a PR file, traced (until the Phase 7 CLI)
   project_context.md # Flask conventions + core path patterns (swappable)
+langfuse/                        # dev only: local Langfuse (official docker-compose.yml + .env.example)
 tests/test_pipeline.py           # one test module: the deterministic layer + the graph's two paths (LLM nodes stubbed), no API key
 ```
 

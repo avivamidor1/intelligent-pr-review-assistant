@@ -18,7 +18,7 @@ A phase is broken into sub-tasks before we start it, and the sub-tasks are revie
 | 5 | ReAct risk agent (`create_agent`) | The agent loop works, stops on budget, and recovers from tool errors | — |
 | 6 | Jev router | The uncertain middle is routed with and without `JEV_API_KEY` | — |
 | 7 | Degradation & CLI | Simulated failures produce degraded output with exit code 3 | — |
-| 8 | Langfuse tracing (dev only) | A nested trace appears in the Langfuse UI | — |
+| 8 | Langfuse tracing (dev only) | A nested trace appears in the Langfuse UI | ✅ Done (early, before Phase 4) |
 | 9 | Deliverables | `code_review_output.json`, `requirements.txt` and the README are done | — |
 
 ---
@@ -428,10 +428,18 @@ Both ran on the whole Phase 3 diff. Validated findings applied; the rest were le
 **Check:** simulated failures produce degraded output with exit code 3, and invalid input exits with 2.
 *Sub-tasks: to be written when the phase starts.*
 
-## Phase 8: Langfuse tracing (dev only)
-**Files:** `observability.py`.
+## Phase 8: Langfuse tracing (dev only) ✅
+**Files:** `observability.py`, `dev_run.py`, `langfuse/` (`docker-compose.yml`, `.env.example`).
 **Check:** a nested trace appears in the Langfuse UI, and the app still runs without the keys.
-*Sub-tasks: to be written when the phase starts.*
+
+*Decision changed (order):* done before Phase 4 instead of after the CLI, at your request, so the LLM phases are traced while they're built. The phase number is kept so existing references stay valid.
+
+- [x] **8.1 Local Langfuse server** — Langfuse's official `docker-compose.yml` (unmodified) in `langfuse/`, with every `CHANGEME` value overridden in `langfuse/.env` (git-ignored; template in `langfuse/.env.example`). Headless init creates the user, org, project and API keys on first start. `TELEMETRY_ENABLED=false`. Kept in the repo at your request (it's dev tooling, not part of the app).
+- [x] **8.2 `observability.py`** — `get_langfuse_handler()` returns a `CallbackHandler` only when both keys are set and `langfuse` is installed; `traced_run(name, metadata=)` yields the run config (`{}` when off), sets the trace name via `propagate_attributes`, and flushes on exit.
+- [x] **8.3 `dev_run.py`** — `uv run python -m agent_workflow.dev_run [pr.json]` runs the graph traced. A stand-in until the Phase 7 CLI, which reuses `traced_run`.
+- [x] **8.4 Test** — `test_tracing_is_optional`: no keys, or keys without the package, gives no handler and `{}` config, and the graph still runs.
+- [x] **8.5 Phase check** — verified via the v2 observations API: one `pr-review` root with each node nested under it (both analysts on the complex path). Keys set with the server down: the run still exits 0 (export errors logged). No keys: tracing off. `uv run --no-dev`: the module imports and returns no handler.
+  - *Note:* the server runs Langfuse v4 in events-only mode, so the legacy `GET /api/public/traces` is unavailable; read traces with `GET /api/public/v2/observations` (SDK: `get_client().api.observations.get_many`).
 
 ## Phase 9: Deliverables
 **Files:** `code_review_output.json`, `requirements.txt`, `README.md`.

@@ -1,19 +1,22 @@
 """Simple tests of the pipeline: the deterministic layer, the graph's paths (including the
-validation retry), and the repair of a draft that still fails validation.
+validation retry), the repair of a draft that still fails validation, and that Langfuse
+tracing stays optional.
 
 The assignment asks for no extensive test suite ("one simple test is fine"), so this module
-has three small parametrized tests over a few representative PRs. No API key, no network.
+has four small parametrized tests over a few representative PRs. No API key, no network.
 """
 
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 
 import pytest
 
 from agent_workflow import config, nodes
 from agent_workflow.graph import build_graph
+from agent_workflow.observability import get_langfuse_handler, traced_run
 from agent_workflow.preprocessing import load_core_patterns, preprocess
 from agent_workflow.router import apply_hard_rules, decide_route
 from agent_workflow.schemas import FocusArea, PRInput, ReviewOutput
@@ -198,3 +201,29 @@ def test_repair_failed_draft(
     assert [a.file for a in repaired.review_focus_areas] == kept
     assert len(trace) == repairs
     assert all(line.startswith("Repair: ") and FAKE_SECRET not in line for line in trace)
+
+
+@pytest.mark.parametrize(
+    ("keys_set", "package_installed"),
+    [
+        pytest.param(False, True, id="no keys: off"),
+        pytest.param(True, False, id="keys but no langfuse package: off"),
+    ],
+)
+def test_tracing_is_optional(
+    keys_set: bool, package_installed: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Langfuse is never required: without keys or the package, the run is untraced (§12)."""
+    for key in ("LANGFUSE_PUBLIC_KEY", "LANGFUSE_SECRET_KEY"):
+        if keys_set:
+            monkeypatch.setenv(key, "x")
+        else:
+            monkeypatch.delenv(key, raising=False)
+    if not package_installed:
+        monkeypatch.setitem(sys.modules, "langfuse.langchain", None)  # import raises ImportError
+
+    assert get_langfuse_handler() is None
+    with traced_run("pr-review") as run_config:
+        assert run_config == {}
+        result = build_graph().invoke({"raw_pr": _sample().model_dump()}, config=run_config)
+    assert isinstance(result["output"], ReviewOutput)
