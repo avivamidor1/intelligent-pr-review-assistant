@@ -1,7 +1,9 @@
 """Graph nodes (docs/PLAN.md §2).
 
 Each node reads the state and returns a partial update. The decisions themselves live in
-pure functions (preprocessing.py, router.py, scoring.py), so the nodes stay thin.
+pure functions (preprocessing.py, router.py, scoring.py), so the nodes stay thin. The LLM
+nodes reach the model only through `llm.structured_call` and build their prompts with
+prompts.py; a test can patch `llm.structured_call` to run them without an API key.
 
 Trace lines are plain sentences; `finalize` numbers them. `degraded` holds node names.
 """
@@ -10,25 +12,29 @@ from __future__ import annotations
 
 from typing import Any
 
-from . import config
-from .preprocessing import load_core_patterns, preprocess
+from . import config, llm, prompts
+from .preprocessing import api_surface, load_core_patterns, preprocess, select_diffs
 from .router import decide_route, describe_paths, describe_route
-from .schemas import ArchitectureFindings, PRInput, ReviewDraft, ReviewOutput, RiskFindings
+from .schemas import ArchitectureFindings, PRInput, ReviewDraft, ReviewOutput
 from .scoring import (
     calibrate_confidence,
     check_draft,
     complexity_score,
     confidence_signals,
-    fallback_review,
     final_focus_areas,
     number_trace,
     repair_draft,
 )
 from .state import ReviewState
 
-# STUB: replaced in Phase 4. Not the fallback's 0.2, so the stub runs show the confidence
-# penalties and caps at work. Stub-only, so it isn't in config.py.
-STUB_CONFIDENCE = 0.8
+
+def _diff_budget(state: ReviewState) -> int:
+    """Tokens of raw diff the route's diff-reading LLM call gets: the architecture analyst's
+    on the complex path, the synthesizer's on the simple path. One definition, shared by
+    those nodes and by finalize's truncation check (D2), so they can't disagree."""
+    if state["route"].route == "complex":
+        return state["plan"].architecture_diff_budget_tokens
+    return config.SYNTH_SIMPLE_DIFF_BUDGET_TOKENS
 
 
 def _require_draft(state: ReviewState, node: str) -> ReviewDraft:
@@ -92,50 +98,85 @@ def classify_pr(state: ReviewState) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# LLM nodes: stubs until Phases 4–5 (no network calls). Only the marked bodies change.
+# LLM nodes. An LLM failure raises until Phase 7 adds degradation; risk_agent is a stub
+# until Phase 5.
 # ---------------------------------------------------------------------------
 
 
 def architecture_analyst(state: ReviewState) -> dict[str, Any]:
-    """Architectural impact in one LLM call (§2). STUB: replaced in Phase 4."""
-    # STUB: replaced in Phase 4.
-    findings = ArchitectureFindings(
-        impact_level="low", summary="Stub: not analysed (no LLM until Phase 4).", findings=[]
+    """Architectural impact in one LLM call (§2, §3.4): the ranked files, the API surface,
+    and the full diffs that fit the architecture budget."""
+    pr, plan = state["pr"], state["plan"]
+    included, cut = select_diffs(pr, plan, _diff_budget(state))
+    findings, usage = llm.structured_call(
+        ArchitectureFindings,
+        effort=config.EFFORT_ARCHITECTURE,
+        system=prompts.architecture_system(),
+        user=prompts.architecture_user(
+            pr, state["classifications"], plan, state["stats"],
+            surface=api_surface(pr, plan), included=included, cut=cut,
+        ),
     )
-    return {"architecture": findings, "reasoning_trace": ["Architecture analyst: stub, no LLM call."]}
+    trace = [f"Architecture analyst: impact {findings.impact_level}, {len(findings.findings)} finding(s)."]
+    if cut:
+        trace.append(f"Architecture analyst: {describe_paths('file', cut)} over the diff budget, not shown.")
+    trace.append(usage.trace_line("architecture_analyst"))
+    return {"architecture": findings, "reasoning_trace": trace}
 
 
 def risk_agent(state: ReviewState) -> dict[str, Any]:
     """The ReAct risk agent (§7). STUB: replaced in Phase 5.
 
-    Nothing is read, so files_inspected stays empty and the coverage cap applies, honestly.
+    It doesn't run, so it reports no result (`risk=None`): the synthesizer is told the risk
+    review is "not available", never that it completed and found nothing. Nothing is read,
+    so files_inspected stays empty and the coverage cap applies, honestly.
     """
     # STUB: replaced in Phase 5.
     return {
-        "risk": RiskFindings(findings=[]),
+        "risk": None,
         "files_inspected": [],
         "risk_budget_exhausted": False,
-        "reasoning_trace": ["Risk agent: stub, no tools run."],
+        "reasoning_trace": ["Risk agent: stub, not run (Phase 5); no risk review."],
     }
 
 
 def synthesize(state: ReviewState) -> dict[str, Any]:
-    """Write the review draft (§8): the small diff on the simple path, the analysts' findings
-    on the complex path. A run with validation errors in the state is a revision."""
+    """Write the review draft in one LLM call (§8): the small diff itself on the simple
+    path, the analysts' findings on the complex path. A run with validation errors in the
+    state is a revision: the previous draft and the errors go into the prompt."""
+    pr, classifications, plan, stats = state["pr"], state["classifications"], state["plan"], state["stats"]
+    route = state["route"].route
+    errors = state["validation_errors"]
+    previous = state["draft"] if errors else None
+
     trace: list[str] = []
     revision_count = state["revision_count"]
-    if state["validation_errors"]:  # kept in Phase 4: the validator sent the draft back
+    if errors:  # the validator sent the draft back
         revision_count += 1
         trace.append(f"Synthesize: revision {revision_count} with the validator's feedback.")
 
-    # STUB: replaced in Phase 4. The rule-based review stands in for the model's draft.
-    draft = fallback_review(state["classifications"], state["plan"], state["stats"]).model_copy(
-        update={
-            "confidence": STUB_CONFIDENCE,
-            "confidence_reasoning": "Stub draft (no LLM until Phase 4).",
-        }
-    )
-    trace.append(f"Synthesize: stub draft from the rule-based review ({state['route'].route} path).")
+    effort: llm.Effort
+    if route == "simple":
+        included, cut = select_diffs(pr, plan, _diff_budget(state))
+        if cut and not errors:  # traced once, not again on a revision
+            trace.append(f"Synthesize: {describe_paths('file', cut)} over the diff budget, not shown.")
+        effort = config.EFFORT_SYNTH_SIMPLE
+        user = prompts.synthesize_simple_user(
+            pr, classifications, plan, stats,
+            included=included, cut=cut, validation_errors=errors, previous=previous,
+        )
+    else:
+        effort = config.EFFORT_SYNTH_COMPLEX
+        user = prompts.synthesize_complex_user(
+            pr, classifications, plan, stats,
+            architecture=state["architecture"], risk=state["risk"],
+            validation_errors=errors, previous=previous,
+        )
+    draft, usage = llm.structured_call(ReviewDraft, effort=effort, system=prompts.SYNTHESIZE_SYSTEM, user=user)
+    trace += [
+        f"Synthesize: draft risk {draft.risk_level} ({route} path, effort {effort}).",
+        usage.trace_line("synthesize"),
+    ]
     return {"draft": draft, "revision_count": revision_count, "reasoning_trace": trace}
 
 
@@ -166,6 +207,8 @@ def finalize(state: ReviewState) -> dict[str, Any]:
     files_inspected, scan_hits = state["files_inspected"], state["stats"].scan_hits
 
     score = complexity_score(classifications)
+    # Recomputed, not stored (D2): select_diffs is pure, so this is the node's own selection.
+    _, diffs_cut = select_diffs(state["pr"], plan, _diff_budget(state))
     signals = confidence_signals(
         route=route,
         plan=plan,
@@ -178,6 +221,7 @@ def finalize(state: ReviewState) -> dict[str, Any]:
         validation_errors=errors,
         degraded=state["degraded"],
         scan_hits=scan_hits,
+        diffs_cut=diffs_cut,
     )
     confidence, confidence_lines = calibrate_confidence(draft.confidence, signals)
     # A no-op unless the draft still fails validation after its retry (§8).

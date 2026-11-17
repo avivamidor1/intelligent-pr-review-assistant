@@ -35,7 +35,7 @@ def hit_location(hit: ScanHit) -> str:
     return f"`{hit.file}`" if hit.file is not None else "the title/description"
 
 
-def _describe_hit(hit: ScanHit) -> str:
+def describe_hit(hit: ScanHit) -> str:
     """Rule name and location only; the matched text is never stored or shown."""
     return f"{hit.kind} scan hit ({hit.pattern}) in {hit_location(hit)}"
 
@@ -56,7 +56,7 @@ def apply_hard_rules(
 
     # 1. Secret or injection scan hits (capped like the path lists).
     hits = stats.scan_hits
-    reasons += [_describe_hit(hit) for hit in hits[: config.ROUTE_REASON_MAX_PATHS]]
+    reasons += [describe_hit(hit) for hit in hits[: config.ROUTE_REASON_MAX_PATHS]]
     if len(hits) > config.ROUTE_REASON_MAX_PATHS:
         reasons.append(f"+{len(hits) - config.ROUTE_REASON_MAX_PATHS} more scan hits")
 

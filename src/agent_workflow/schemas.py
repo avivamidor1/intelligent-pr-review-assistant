@@ -180,11 +180,17 @@ class FocusArea(BaseModel):
 
 
 class ReviewDraft(BaseModel):
+    """The model's draft (§8). Only limits the API's structured output enforces are set
+    here. The focus-area maximum and the confidence range would only reach the model as
+    hints, so a slip would fail the parse and end the run; finalize enforces them instead
+    (cut to MAX_FOCUS_AREAS with a trace line; confidence clamped), and ReviewOutput keeps
+    every limit."""
+
     risk_level: Level
     risk_reasoning: str
     architectural_impact: str
-    review_focus_areas: list[FocusArea] = Field(min_length=1, max_length=config.MAX_FOCUS_AREAS)
-    confidence: float = Field(ge=0, le=1)
+    review_focus_areas: list[FocusArea] = Field(min_length=1)
+    confidence: float
     confidence_reasoning: str
 
 

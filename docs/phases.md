@@ -14,7 +14,7 @@ A phase is broken into sub-tasks before we start it, and the sub-tasks are revie
 | 1 | Setup & schemas | The sample loads and validates, and bad inputs give clear errors | ✅ Done |
 | 2 | Deterministic layer | Preprocessing, routing rules and scoring give correct results on the sample and synthetic PRs | ✅ Done |
 | 3 | Graph skeleton | The graph compiles, prints Mermaid, and both paths run on stubs | ✅ Done |
-| 4 | LLM foundation | First real run on the sample | — |
+| 4 | LLM foundation | First real run on the sample | ✅ Done |
 | 5 | ReAct risk agent (`create_agent`) | The agent loop works, stops on budget, and recovers from tool errors | — |
 | 6 | Jev router | The uncertain middle is routed with and without `JEV_API_KEY` | — |
 | 7 | Degradation & CLI | Simulated failures produce degraded output with exit code 3 | — |
@@ -431,7 +431,271 @@ Both ran on the whole Phase 3 diff. Validated findings applied; the rest were le
     - **The graph test runs the graph twice:** decided in the Phase 3 review (#6). Revisit in Phase 4 if the fake LLM nodes are stateful.
     - **The unread must-review set is computed twice:** the same helper is used, as in the Phase 3 review (#7).
 
-*Sub-tasks 4.1+: to be written next, for your review.*
+**Goal:** `architecture_analyst` and `synthesize` make real Claude calls, and the first real run on the sample produces a valid review. `risk_agent` stays a stub (Phase 5), and node degradation stays in Phase 7: a failed LLM node still raises.
+
+**Design references:** PLAN.md §3.4 (API surface, diff budget), §5 (models, API behaviours), §8 (`synthesize` input and rubric), §9 (LLM failures, untrusted input), §10 (caching, usage accounting).
+
+**Checked before writing these sub-tasks** (installed `langchain-anthropic` 1.7.10, `anthropic` 2.7.0, and the Claude API reference):
+- **Effort:** `ChatAnthropic(reasoning_effort=...)` (alias `effort`) is sent as `output_config.effort`. On Opus 5.5 the default is `medium`, so every node sets it explicitly.
+- **Thinking:** it can't be disabled on Opus 5.5 (a 400), so `thinking` is never sent and effort is the only control. `temperature` is never sent either.
+- **Structured output:** `with_structured_output(Schema, method="json_schema")` is sent as `output_config.format`. Forced `tool_choice` returns a 400, so `function_calling` is never used.
+- **Refusal fallback:** this is the beta `server-side-fallback-2026-07-01` with `fallbacks: "default"`, sent through `client.beta.messages.create`. SDK 2.7.0 accepts `fallbacks`, and `ChatAnthropic(betas=[...])` routes the call to the beta endpoint. **Not yet verified:** that `fallbacks` passes through `model_kwargs`, and that `langchain-anthropic` parses a response containing a `fallback` block (4.1).
+- **Caching:** the minimum cacheable prefix on Opus 5.5 is **512 tokens**. Cache reads cost $0.20/MTok and 5-minute writes 1.25× the input price. `usage_metadata.input_token_details` exposes `cache_read` and `cache_creation`.
+- **Pricing:** Opus 5.5 costs $4 per MTok of input and $20 per MTok of output. Non-streaming calls use `max_tokens` of about 16K.
+
+- [x] **4.1 Verify-first spike (2–3 small paid calls, est. < $0.05)** ✅ *2 paid calls, actual cost **$0.027***
+  - **Results:**
+    - **Payload, offline:** as expected. It holds `betas: ["server-side-fallback-2026-07-01"]`, `fallbacks: "default"`, `output_config: {effort, format: {type: "json_schema"}}`, the system prompt's `cache_control` breakpoint, and no `temperature`.
+      - *Correction:* `langchain-anthropic` adds `thinking: {"type": "adaptive", "display": "summarized"}` by itself whenever effort is set. That's valid on Opus 5.5 (adaptive is the default; `display` changes visibility, not billing), so we leave it; the summaries will show in Langfuse. The rule stays "never *disable* thinking".
+    - **Schema mismatch, offline:** invalid JSON and a wrong shape both give `langchain_core.exceptions.OutputParserException`. With `include_raw=True`, it is **returned** in `parsing_error`, not raised, so `llm.py` raises it, as its own `LLMSchemaError` (see 4.3), which `RetryPolicy` retries.
+    - **Refusal, by reading the code:** `response_metadata["stop_reason"] == "refusal"` (plus `stop_details`). Its content wouldn't parse, so it would show up as an `OutputParserException` and be **retried**. `llm.py` therefore checks `stop_reason` **before** the parse result and raises `LLMRefusal` instead, which is never retried (§9: refusals fail fast).
+    - **Real calls (2 identical, effort `low`):**
+      - Both returned a parsed `ArchitectureFindings` with `stop_reason: end_turn`.
+      - The beta and `fallbacks` were accepted (no 400), and `ls_structured_output_format` isn't sent.
+      - Caching works: the system prompt (`project_context.md` + instructions = **3,576 tokens**, more than D1's estimate of about 1.5K) was written on call 1 and read on call 2. Cost per call: $0.022 → $0.005.
+    - **Usage gotcha:** `usage_metadata.input_token_details.cache_creation` was **0** on the write. The write appears only under `ephemeral_5m_input_tokens`. So the cost uses the raw `response_metadata["usage"]` fields (`input_tokens`, `cache_creation_input_tokens`, `cache_read_input_tokens`, `output_tokens`), not `usage_metadata`.
+  - **Not verified:** how a *successful* server-side fallback looks (a `fallback` content block next to the text). No refusal happened, and one can't be triggered on purpose. It's covered defensively: `llm.py` reports `response_metadata["model"]` in the usage line, so a fallback model shows up in the trace.
+  1. **Offline, no cost:** build the request payload and confirm it contains `output_config.effort`, `output_config.format`, the beta and `fallbacks`, and no `thinking` or `temperature`.
+  2. **Offline, no cost:** feed the structured-output parser bad JSON and record the **exact exception type**, which becomes `RetryPolicy(retry_on=...)` in 4.7.
+  3. **One real call:** check that the parsed Pydantic object comes back with `usage_metadata`.
+  4. **A second identical call:** check `cache_read > 0`.
+  5. **Refusal:** read the code path for how `stop_reason: "refusal"` surfaces. A refusal can't be triggered on purpose, so this is a reading check, not a test.
+  - *Done when:* the results are written here, and any API assumption that turns out wrong is reported before code depends on it.
+
+- [x] **4.2 `config.py`: the LLM constants** ✅
+  - `MODEL_MAIN = "claude-opus-5-5"`, overridable by the `MODEL_MAIN` env var (§5). *Decision:* `llm.py` reads the override at call time, not `config.py` at import time. `dev_run` imports `config` before it loads `.env`, so an import-time read would ignore an override set in `.env`.
+  - `EFFORT_ARCHITECTURE = "medium"`, `EFFORT_SYNTH_SIMPLE = "low"` and `EFFORT_SYNTH_COMPLEX = "medium"` (§5). *Changed:* named constants instead of a dict, matching the rest of `config.py`. The risk agent's effort is added in Phase 5.
+  - `LLM_MAX_TOKENS = 16_000`, `LLM_MAX_RETRIES = 3` (§9), `SCHEMA_RETRY_ATTEMPTS = 2` (§9), and the fallback beta name.
+  - `SYNTH_SIMPLE_DIFF_BUDGET_TOKENS` (20K at first, **100K** after the 4.8 budget decision) and `SYNTH_MAX_FINDINGS = 15` (§3.4, §8).
+  - Prices for the cost estimate: input, output, cache read and 5-minute cache write. They are labelled as an estimate.
+
+- [x] **4.3 `llm.py`: the LLM boundary (the only module that imports `langchain_anthropic`)** ✅
+  - *Your requirement (added at 4.3):* the graph depends on our own provider-independent wrapper, not on Anthropic objects. It's kept minimal: one public function and our own types, with no provider registry, `Protocol` or base class. Adding a provider later changes only `llm.py`'s private section.
+  - **Public (all the nodes see):**
+    - `structured_call(schema, *, effort, system, user) -> tuple[schema instance, Usage]`, where `Effort = Literal["low", "medium", "high"]`,
+    - `Usage`: the answering model, uncached input, cache reads and writes, output, the estimated cost, and `trace_line(label)`, e.g. `LLM synthesize: 3,650 tokens in (3,576 cached), 197 out, ~$0.005 (claude-opus-5-5).`,
+    - errors: `LLMError` (not retried, e.g. the answer hit `max_tokens`), `LLMRefusal` (never retried) and `LLMSchemaError` (the only error `RetryPolicy` retries).
+  - **Private (Claude):**
+    - `ChatAnthropic` with the effort, `max_tokens`, SDK retries, the refusal-fallback beta and `fallbacks: "default"`, built per call,
+    - the system prompt with a `cache_control` breakpoint, and `with_structured_output(method="json_schema", include_raw=True)`,
+    - `MODEL_MAIN` read from the env at call time,
+    - cost from the API's own usage fields (see 4.1).
+  - **Check order in `_interpret`:** refusal, then `max_tokens`, then the parse result. A refused or cut-off answer also fails to parse, but retrying would only repeat it.
+  - *Changed from the plan:* `RetryPolicy` (4.7) retries our `LLMSchemaError`, not LangChain's `OutputParserException`, so the graph doesn't depend on LangChain's parser. PLAN.md §9 and §13 are updated.
+  - **Test:** `test_llm_response_handling` (4 cases: valid, refusal, `max_tokens`, schema mismatch).
+    - It asserts the exact error class, and that the cost estimate reproduces the real 4.1 call ($0.0221).
+    - Fault injection: checking the parse result before the refusal makes it fail.
+    - The real model's payload was rechecked offline and matches 4.1.
+
+- [x] **4.4 `preprocessing.py`: the API-surface extraction and diff selection (pure, deterministic)** ✅
+  - `api_surface(pr, plan) -> list[str]` covers the non-filtered Python files, in `ranked_files` order.
+    - It looks at added and removed lines (reusing `_hunks`) for **top-level** `def`, `async def` and `class` at column 0, so methods and nested functions are skipped. It also looks at public module-level assignments (`NAME = …`, `NAME: T = …`, plus `__all__`), but not comparisons (`==`), augmented assignments (`+=`) or `_private` names.
+    - Each (kind, name) gives one entry: `added`, `removed`, or `changed` (removed and added, typically a new signature), e.g. `src/flask/rate_limiter.py: added class MemoryRateLimiter`.
+    - Other languages are skipped. Because it works line by line, a `def` at column 0 inside a multi-line string is a rare false positive we accept.
+    - *Changed:* it takes `plan` instead of `classifications`, because `ranked_files` already excludes mechanical files and gives the order.
+  - `select_diffs(pr, plan, budget_tokens) -> (included, cut)` takes whole diffs in `ranked_files` order and never cuts a file mid-diff.
+    - *Decision:* a file that doesn't fit is **skipped, and later, smaller files may still use the room left**, which covers more files within the same budget. The cut files are named in the prompt, and they make the review "truncated" (4.8).
+  - **On the sample:** the surface is `__all__` and `MemoryRateLimiter` in `rate_limiter.py`, plus the two new test functions. `app.py` adds none, correctly, since its changes are methods inside `class Flask`. All 3 diffs fit the budget (about 1.6K tokens; the budget was 40K at the time, 150K now).
+  - **Test:** `test_llm_inputs_api_surface_and_diff_selection` covers:
+    - a method skipped, a changed signature, `async def`, an annotated name, `__all__`,
+    - a private name skipped, a comparison skipped, a removed name, a context line ignored,
+    - a non-Python file skipped, and a mechanical file excluded,
+    - the budget: an exact fit, skip-and-continue, and nothing fitting.
+
+- [x] **4.5 `prompts.py`: every prompt, static content first** ✅
+  - **System prompts:** static, with no PR content, dates or run values, so they cache.
+    - `architecture_system()`: the role, what counts as architectural impact, the impact levels, and the rules on files and the budget. Then the shared evidence rule (every finding quotes an exact diff excerpt, general-knowledge claims start with "Assumption:", and what can't be judged becomes "verify …"), the shared data rule, and **`project_context.md` in a `<project_context>` block (D1)**. About 2.6K tokens.
+    - `SYNTHESIZE_SYSTEM`: the §8 risk rubric and rules (secret outside tests → high, disagreements stated, focus areas 1–6 on changed files only, confidence and what limits it), what `<validator_feedback>` means, and the same two shared rules. About 620 tokens by a 4-chars-per-token estimate, just over the 512 minimum; 4.10 checks that it caches.
+  - **User messages:**
+    - `architecture_user`: the overview, the API surface, and the selected diffs.
+    - `synthesize_simple_user`: the overview, the scan hits, the diffs, and on a retry the previous draft and the validator feedback.
+    - `synthesize_complex_user`: the overview, the scan hits, and both analysts' findings (highest severity first, at most 15, then counts of the rest, risk findings marked evidence verified or not verified), never raw diffs; the same retry blocks.
+  - **The overview** lists the title, author, description, the files in priority order with their flags, the mechanical files skipped, the stats and `must_review`.
+  - **Untrusted text:** all PR text, file paths included, is inside data blocks (`pr_overview`, `pr_diff`, `omitted_diffs`, `api_surface`, `scan_hits`, `analyst_findings`, `previous_draft`).
+    - Any of our tag names inside it, opening or closing and in any case, is escaped (`<pr_diff` → `&lt;pr_diff`). Nothing else changes, so quoted evidence still matches the diff.
+    - Paths in attributes are HTML-escaped.
+    - Scan hits are described by rule name and location only, never the matched text.
+  - *Changed:*
+    - `router._describe_hit` is now public (`describe_hit`), so the trace and the prompt describe hits the same way.
+    - The builders take `stats` (scan hits and the stats line come from it).
+    - Cut files go in an `<omitted_diffs>` block rather than plain text, because paths are untrusted too.
+  - **Test:** `test_prompt_data_blocks`:
+    - a hostile title, description and diff (closing tags, a fake opening tag in another case, fake scan hits) can't open or close a block, and ordinary markup in a diff stays unchanged,
+    - the system prompts contain no PR text,
+    - the complex path shows 15 of 17 findings, highest severity first, with the count of the rest and no raw diffs.
+    - Fault injection: removing the escaping makes it fail.
+
+- [x] **4.6 `nodes.py`: the two real LLM nodes** ✅
+  - `architecture_analyst`: `select_diffs` within `plan.architecture_diff_budget_tokens`, then `llm.structured_call(ArchitectureFindings, effort=EFFORT_ARCHITECTURE, …)`. Trace: the impact and finding count, any files over the budget, the usage line.
+  - `synthesize`:
+    - **simple path:** diffs within `SYNTH_SIMPLE_DIFF_BUDGET_TOKENS`, at effort `low`,
+    - **complex path:** the analysts' findings, at effort `medium`,
+    - **a revision:** passes the previous draft plus `validation_errors` (the `revision_count` logic is unchanged).
+    - Trace: the draft's risk, the path and effort, the usage line.
+  - Removed: `STUB_CONFIDENCE`, both Phase 4 stub bodies, and the now-unused `fallback_review` import (the function stays for Phase 7). `risk_agent` keeps its stub.
+  - Nodes reach the model only through `llm.structured_call` (looked up on the module), so tests patch that one function.
+  - **Schema constraints, checked offline:** the SDK's `transform_schema` moves constraints that structured output doesn't support into the field description (`review_focus_areas`: `minItems: 1` kept, `{maxItems: 6}` in the description; `confidence`: `{maximum: 1, minimum: 0}`). Our Pydantic model still enforces them, so a violation is an `LLMSchemaError` (retried once, 4.7). The prompt also asks for 1–6 focus areas. *Superseded by D4 (review pass before 4.10): `ReviewDraft` no longer has these limits, and `finalize` enforces them.*
+  - **Tests** (the 4.9 fake was brought forward, because the existing graph tests would otherwise call the API):
+    - An **autouse** fixture `llm_calls` replaces `llm.structured_call` in every test with a stateless fake that records each call (schema, effort, prompts). No test can reach the network.
+    - `test_graph_paths` now also checks each run's calls: an architecture call only on the complex path, at `medium` and with the diffs and API surface; synthesize at `low` (simple) or `medium` (complex); `<validator_feedback>` only on the retry; raw diffs only on the simple path; the shared system prompt; one usage line per synthesize call.
+    - Fault injection: the wrong effort, a retry without feedback, and an architecture prompt without diffs each make it fail.
+
+- [x] **4.7 `graph.py`: `RetryPolicy` on the two LLM nodes** ✅
+  - `SCHEMA_RETRY = RetryPolicy(max_attempts=SCHEMA_RETRY_ATTEMPTS, retry_on=llm.LLMSchemaError)` on `architecture_analyst` and `synthesize` (`LLM_NODES`). LangGraph's defaults are kept for the backoff (0.5 s, ×2, jitter).
+  - **Why `retry_on` must be explicit:** LangGraph's `default_retry_on` retries every exception except a fixed list of programming errors (`ValueError`, `TypeError`, …). It would therefore retry our `LLMRefusal` and `LLMError`, but §9 says refusals fail fast. Matching is by `isinstance`, so only `LLMSchemaError` is retried.
+  - Transient API errors stay with the SDK (`max_retries=3`), so the two retry layers never stack on the same failure.
+  - **Test:** `test_llm_retry_policy` (4 cases on the simple path, using the real policy object):
+    - a schema mismatch once: 2 attempts, then a review,
+    - a schema mismatch every time: 2 attempts, then `LLMSchemaError`,
+    - a refusal: 1 attempt, then `LLMRefusal`,
+    - another `LLMError`: 1 attempt.
+    - Fault injection: the default `retry_on` (refusals and errors retried) and no policy at all each make 2 cases fail. The backoff adds about 2 s to the suite.
+
+- [x] **Budget decision (before 4.8): raise the diff budgets** ✅
+  - **Your question:** Opus 5.5 has a 1M context, so are 40K (architecture) and 20K (simple path) based on cost, latency or quality, or just conservative?
+  - **Answer:** conservative judgment calls, not measured.
+    - They're caps, not spend: a PR below the cap costs the same at any cap.
+    - **20K mattered only for big docs-only PRs.** Simple code PRs are ≤ 50 lines by the routing rules, so the cap could drop whole doc files from a docs-only review.
+    - **40K mattered only for very large PRs.** Even then, cut files are named, they cap confidence, the API surface still covers every Python file, and the risk agent reads any diff on demand.
+  - **Decision (yours):**
+    - `ARCH_DIFF_BUDGET_TOKENS = 150_000`: about 600K characters, about 15K diff lines; worst case about $0.60 of uncached input per call.
+    - `SYNTH_SIMPLE_DIFF_BUDGET_TOKENS = 100_000`.
+    - Both are documented in `config.py` and PLAN.md §3.2 and §8 as **initial values, not empirically validated**. Omitted-file reporting and the confidence cap stay.
+    - Tuning them needs paid runs on large PRs, which wait for your approval.
+
+- [x] **4.8 `finalize`: truncation from the diff budgets (PLAN.md §8, "Truncated diffs: budget or malformed")** ✅
+  - `confidence_signals(..., diffs_cut=...)`: `truncated` is true for a malformed or missing diff **or** any file the route's diff budget left out.
+  - **D2 (approved):** `finalize` recomputes the cut files with the same pure `select_diffs` call; there's no new state field and the graph is unchanged.
+  - `nodes._diff_budget(state)` is the single definition of the budget for each path (architecture budget on complex, simple budget on simple). The two nodes and `finalize` all use it, so they can't disagree.
+  - The cap stays `CONF_CAP_TRUNCATED = 0.7`, traced as "confidence capped at 0.70: part of the diff wasn't seen".
+  - **Test:** `test_diff_budget_truncation`, 3 cases:
+    - **simple path over its budget:** `<omitted_diffs>` and no `<pr_diff>` in the synthesize prompt, the node's "over the diff budget, not shown" trace line, the 0.70 cap,
+    - **complex path over the architecture budget:** the same, with the stub risk agent replaced by one that "read" every must-review file, so the 0.5 coverage cap doesn't hide the 0.7 truncation cap,
+    - **complex path within the real budget:** nothing cut, no cap.
+    - Fault injection: `finalize` ignoring the cut files (2 cases fail) and `finalize` using the simple budget on the complex path (1 case fails).
+
+- [x] **4.9 Tests (no API key, no network)** ✅
+  - Most of the checklist was done along the way, a test per sub-task:
+
+    | Planned | Where |
+    |---|---|
+    | `api_surface` and `select_diffs` | `test_llm_inputs_api_surface_and_diff_selection` (4.4) |
+    | Data blocks the PR can't escape | `test_prompt_data_blocks` (4.5) |
+    | The graph on a fake `structured_call` (effort per path, retry input) | the autouse `llm_calls` fixture + `test_graph_paths` (4.6) |
+    | `RetryPolicy` | `test_llm_retry_policy` (4.7) |
+    | Truncation from the budgets | `test_diff_budget_truncation` (4.8) |
+    | Response → result or error, cost | `test_llm_response_handling` (4.3) |
+
+  - **Gap found and closed:** `structured_call` itself never ran in a test, since the fake replaces it everywhere, so nothing guarded the real request 4.1 verified.
+    - New `test_llm_request_payload` builds the real payload offline (placeholder key, nothing sent) and checks: model, `max_tokens`, effort, the fallback beta and `fallbacks`, the system prompt's cache breakpoint, adaptive thinking, no `temperature` or `tool_choice`, and the `MODEL_MAIN` env override at call time.
+    - To test it, the message construction moved into `llm._messages`.
+    - Fault injection: dropping the cache breakpoint, or ignoring the env override, each makes it fail.
+  - **The 4.0 note on running the graph twice: closed, unchanged.**
+    - `test_graph_paths` still runs `stream` (the node order) and `invoke` (the output schema hides the internal state, which `stream`'s values mode doesn't show).
+    - The fake is stateless, so both runs see the same answers. The call assertions use the second run's half of the recorded calls.
+  - **Checks:**
+    - `uv run pytest -q` passes (29), also with `ANTHROPIC_API_KEY` and the Langfuse keys unset.
+    - The autouse fake means no test can reach the network.
+    - The suite takes about 2.5 s; the two retry cases (real backoff) account for about 1.7 s.
+
+- [x] **Review pass before 4.10 (code-review + code-simplifier on the Phase 4 diff)** ✅
+  - 28 findings (10 code-review, 18 code-simplifier; one reported by both). Each was checked against the code, and you approved the list.
+  - **Applied, prompts:**
+    - **P1 (both tools):** the synthesizer had the architecture analyst's evidence rule ("each finding cites `evidence`… ground every claim in the diff"), but it writes no findings and sees no diff on the complex path. It now has its own rule: ground claims in the diff or in the analysts' quoted evidence, treat unverified evidence as weaker.
+    - **P2:** "You always get the PR's facts, plus either the diff or the findings, never both."
+    - **P3:** the focus-area count is built from `config.MAX_FOCUS_AREAS`.
+    - **P4:** the data rule is re-wrapped.
+  - **Applied, API surface:**
+    - **A1:** Python keywords (`else: y = 2`) and prose after a colon (`Note: see https://x?a=1`) are no longer reported as names; annotations may hold only type-like characters.
+    - **A2:** private `def _x` and `class _X` are skipped, the same rule as for assignments.
+    - **A3:** the suffix check ignores case (`.PY`).
+    - **A4:** changes are matched by name, so `def` → `async def` is "changed", and an identical definition line on both sides (a move) is left out.
+  - **Applied, B1:** `_block` strips only the outer newlines, so a diff's own whitespace is kept and quoted evidence still matches.
+  - **Applied, D4 (yours):** `ReviewDraft` keeps only "at least 1 focus area", which the API enforces. The 6-item maximum and the 0–1 confidence range would reach the model only as hints, so a slip would fail the parse, be retried with the same prompt, and end the run. `finalize` now enforces both (it cuts with a trace line, and clamps), and `ReviewOutput` keeps every limit. PLAN.md §8 is updated.
+  - **Applied, cleanups:** plain `if`s instead of nested conditionals; one loop instead of a generator reusing `line`; `_surface_item`; a PEP 8 blank line; plain locals in `_usage`; the provider named in the docstring; `config.LLM_MAX_RETRIES` named in `graph.py`; the "raised from" history moved out of `config.py` (still "INITIAL VALUES, not empirically validated"); the test docstring as bullets with no count; `synth_runs`; a `nonlocal` counter; `reverse=True` in the sort.
+  - **Tests:** the API-surface test gains keyword, prose, private, `async`, moved and `.PY` cases; the data-block test gains a trailing-whitespace case. New `test_draft_limits_enforced_in_finalize`: 7 focus areas and confidence 1.3 parse, the run completes with 6 areas, a "cut by the limit" line and capped confidence, and no retry.
+    - Fault injection: not skipping keywords, reporting moves, a full `.strip()`, and reverting D4 each make a test fail.
+  - **Not changed, with reasons:**
+    - **Cost at Opus prices when a fallback model answers:** fallbacks are rare and unverified (4.1), and the usage line names the model.
+    - **A new client per call:** the setup is small next to a multi-second call, the Phase 5 agent keeps one instance for its loop, and a cache would add global state.
+    - **The simple budget on `ReviewPlan`:** `_diff_budget` is already the single source, and D2 was approved.
+    - **The double guard on the previous draft**, and `.get` vs `[]`: harmless.
+
+- [x] **4.10 First real run on the sample** ✅ *Option A (yours): one paid run, not two. Actual cost **≈ $0.100** (estimate $0.05–0.10).*
+  - **Result:** `uv run python -m agent_workflow.dev_run` exited 0 in about 30 s, with Langfuse tracing on.
+    - **The output is valid:** risk `high`, complexity 5.5, 6 focus areas, all on changed files.
+    - **Validation passed first time**, so there was no retry.
+    - **Confidence:** the model said 0.80; finalize gave 0.50 (−0.05 for the core file, then the coverage cap, because the stub risk agent read nothing). That is as designed.
+  - **Calls**, both `claude-opus-5-5` and costed from the API's usage fields:
+
+    | Call | Effort | Input (of which cache written) | Output | Cost |
+    |---|---|---|---|---|
+    | `architecture_analyst` | medium | 7,412 (4,323) | 1,320 | $0.060 |
+    | `synthesize` | medium | 3,323 (1,621) | 1,244 | $0.040 |
+
+  - **Verified, the three reasons for running now:**
+    1. **Structured output with thinking at `medium`** parses, so `include_raw` and the JSON-schema parse work next to thinking.
+    2. **`ReviewDraft` is accepted by the real API**, with the transformed schema and D4.
+    3. **The prompts give a grounded review:**
+       - the architecture analyst quoted exact diff lines (`self._enforce_rate_limit(ctx)`, `return req.access_route[0]`, `__all__ = ("MemoryRateLimiter",)`),
+       - it applied the project conventions by name (scope, forwarded headers, config docs, test fixtures),
+       - it labelled one point "Assumption:" (the Flask-Limiter key clash).
+  - Both system prompts were **written to the cache**: architecture 4,323 tokens, synthesize 1,621. Reading them back needs a second run, so it moves to Phase 5.
+  - **Langfuse:** one `pr-review` trace; every node nested; each Claude call is a generation under its node, with the model and usage.
+  - **Problems found:**
+    - **F1, misattribution (prompt).** Every finding came from the architecture analyst, and the stub risk reviewer had none ("Risk reviewer: completed."). Yet the draft says "Both analysts agree" and "The risk reviewer has three high findings". The findings block doesn't say how many findings each analyst reported. This can recur in Phase 5 whenever the risk agent finds nothing.
+    - **F2, doubled generations in Langfuse (dev only).** Each call appears twice: `ChatAnthropic` (LangChain) and `anthropic.messages.create`, the Anthropic SDK's own tracing span (scope `com.anthropic.sdk.python`). Langfuse's cost totals per trace are therefore about 2×. Our own trace line is correct. Langfuse has a `should_export_span` hook to drop that scope.
+  - **F1, fixed (offline, no paid re-run):**
+    - The findings block now states each analyst's own count, e.g. "Architecture analyst: impact high, 6 finding(s). …" and "Risk reviewer: completed, 0 finding(s).".
+    - `SYNTHESIZE_SYSTEM` adds a rule: each finding is labelled with its analyst; attribute it only to that analyst; say the analysts agree only on a point both reported; 0 findings means nothing to report.
+    - `test_prompt_data_blocks` checks the counts, the label and the rule. Reverting the count makes it fail.
+    - Whether the model now attributes correctly is checked on the next paid run (Phase 5).
+  - **F2, deferred to Phase 5 (your decision):** still open as described above. *To do in Phase 5:* filter scope `com.anthropic.sdk.python` through Langfuse's `should_export_span`, after verifying that a custom filter doesn't drop Langfuse's default spans, then check one trace has one generation per call.
+  - **Moved to Phase 5:** the second run (cache reads), the Langfuse walkthrough, judging review quality with a real risk agent, and checking the F1 fix on a real run.
+
+- [x] **4.11 Docs and final review pass** ✅
+  - **F1 (from 4.10), fixed before the pass.** See 4.10.
+  - **Final pass:** code-review (level `high`) and code-simplifier (report-only) on **all** Phase 4 changes, including the new `llm.py` and `prompts.py`. 18 findings (10 code-review, 8 code-simplifier). Each was checked against the code, and you approved the list.
+  - **Applied, code review:**
+    - **R1, a side effect of D4:** an out-of-range model confidence (e.g. `85`) had the penalties subtracted from it, then the final 0.95 cap hid them, giving the highest possible confidence.
+      - *Scale checked first:* the prompt says "confidence (0 to 1)", the schema note says 0–1, and nothing defines a percentage.
+      - So `calibrate_confidence` clamps the model's value to [0, 1] **before** the penalties (it never reinterprets 85 as 85%), with a trace line ("model confidence 85 is outside 0–1; clamped to 1.00 before adjustments").
+      - PLAN.md §8 is updated.
+    - **R2:** the stub risk agent returned an empty `RiskFindings`, so with the F1 counts the synthesizer read "Risk reviewer: completed, 0 finding(s)", i.e. a review that found nothing, although it never ran. It now returns `risk=None` ("Risk reviewer: not available.") and traces "stub, not run". Coverage and confidence are unchanged, since `None` is already handled.
+    - **R3:** the API-surface annotation rule accepted words separated by spaces, so prose like `Note: see this = that` was a "name". An annotation must now look like a type: dotted names, `[...]` subscripts, joined by `|`.
+      - **Documented limitation (accepted, rare):** a keyword argument at column 0 inside a call (`a=1,`) can't be told apart from a valid tuple assignment, so it's reported as a name. Formatters indent such lines.
+    - **R4:** the prompt's per-file flags are built from `router.STRUCTURAL_FLAGS`, the labels routing and the fallback review use ("core file", "deleted source file", …), plus two flags only the model needs. The old copy had drifted.
+    - **R5:** a simple-path revision traced the "over the diff budget" line again; now only the first attempt does.
+  - **Applied, code-simplifier (S1–S8):** `strip("\n")` on its own line; the data rule says "report it as a concern" (the synthesizer writes no findings); "diff budget" in the architecture prompt; `kind` picked once in `api_surface`; two duplicated inline comments removed from `ReviewDraft`; a local for the omitted-files list; tests built from `config.MAX_FOCUS_AREAS` and `SYNTH_MAX_FINDINGS`; the 4.6 note above marked as superseded by D4.
+  - **Tests:**
+    - **New `test_confidence_clamped_before_penalties`:** `85` and `1.3` → clamped to 1.0, then −0.05 and −0.10 → **0.85**; `0.9` → 0.75 with no clamp line; `−0.2` → the 0.1 floor.
+    - `test_graph_paths` checks the R4 flag label and that a complex-path prompt says "Risk reviewer: not available." (R2).
+    - The API-surface test adds a prose line and an `int | None` annotation (R3).
+    - The truncation test adds a simple-path revision whose budget line appears once (R5).
+    - The D4 test checks the clamp line.
+    - **Fault injection:** undoing each of R1–R5 makes a test fail (R1: 4, R2: 3, R3: 1, R4: 2, R5: 1).
+      - *Note:* the first R2 injection replaced the wrong `"risk": None` (the one in `parse_pr`, not the stub) and wrongly looked uncaught. Rerun on the stub, the intended assertion catches it.
+  - **Not changed, with reasons:**
+    - **Failed calls' usage isn't in the trace:** a retried node returns no state, so the failed attempt can't write a line. Langfuse records it. Known limitation; Phase 7 (node failures) can attach usage to the error.
+    - **The escaping of our tag names inside a diff:** the deliberate, documented exception (the reviewer's `&amp;lt;` example doesn't happen, since `&` isn't escaped). *Phase 5 note:* the evidence guards should apply the same escaping to the diff before comparing.
+    - **Fallback-model prices, and a new client per call:** decided in the earlier pass.
+    - **`finalize` recomputing the cut diffs:** D2.
+    - **"PLAN.md edited to justify the implementation":** the edits record decisions you approved (the budgets, D2, D4), as CLAUDE.md asks.
+  - **Checks:** `uv run pytest -q` passes (35), `py_compile` is clean, and the graph diagram prints. No paid calls in 4.11.
+
+**Decisions needed before implementing:**
+- **D1. Project conventions in the architecture prompt?** PLAN §4 lists `project_context.md` as a context source but doesn't say which node gets it.
+  - *Recommended:* put the whole file at the end of `ARCHITECTURE_SYSTEM`. It's static, so it caches, and about 1.5K tokens is above the 512-token minimum. The analyst judges impact *against* the project's architecture.
+  - *Alternative:* leave it to the Phase 5 risk agent's `read_project_context` tool only.
+- **D2. How `finalize` learns that the budget cut a file.**
+  - *Recommended:* recompute it in `finalize` with the same pure `select_diffs` call. It's deterministic, needs no new state field, and the graph stays unchanged.
+  - *Alternative:* add a `ReviewState` field, which changes PLAN §6.
+- **D3. Paid calls.** Your approval is needed for about 2–3 calls in 4.1 (< $0.05) and 2 sample runs in 4.10 (about $0.10–0.30 each). Cost estimates are from list prices; the real figures will be recorded.
+
+**Out of scope for Phase 4:**
+- the risk agent and the hallucination guards (Phase 5), so architecture findings aren't evidence-checked yet,
+- Jev (Phase 6),
+- degradation on LLM failure, the CLI and exit codes (Phase 7).
 
 ## Phase 5: ReAct risk agent (`create_agent`)
 **Files:** `tools.py` (`@tool` functions, `ToolInputError`, the `on_error` handler), `project_context.md`, `risk_agent.py` (`RiskAgentState`, `RiskAgentContext`, the middleware, budgets, wrapper, recovery call, hallucination guards, coverage check).

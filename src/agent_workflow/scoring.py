@@ -133,13 +133,19 @@ class ConfidenceSignals:
 
 
 def calibrate_confidence(base: float, signals: ConfidenceSignals) -> tuple[float, list[str]]:
-    """Subtract every penalty, then apply every cap with min(), then clamp.
+    """Clamp the model's value to 0–1, subtract every penalty, apply every cap with min(),
+    then clamp to [CONF_MIN, CONF_MAX].
 
-    Returns (confidence rounded to 2 decimals, one trace line per adjustment). A cap is
-    traced only when it actually lowers the value.
+    The prompt asks for 0–1, but the schema doesn't enforce it (D4), so an out-of-range
+    value is clamped first: otherwise penalties subtracted from e.g. 85 would vanish under
+    the final cap. A value is never reinterpreted (85 isn't read as 85%): the prompt
+    defines no percentage scale. Returns (confidence rounded to 2 decimals, one trace line
+    per adjustment). A cap is traced only when it actually lowers the value.
     """
     trace: list[str] = []
-    value = base
+    value = clamp(base, 0, 1)
+    if value != base:
+        trace.append(f"model confidence {base:g} is outside 0–1; clamped to {value:.2f} before adjustments")
 
     penalties: list[tuple[float, str]] = []
     if signals.disagreement_levels == 1:
@@ -241,12 +247,15 @@ def confidence_signals(
     validation_errors: Sequence[str],
     degraded: Sequence[str],
     scan_hits: Sequence[ScanHit],
+    diffs_cut: Sequence[str],
 ) -> ConfidenceSignals:
     """Map the review's state to the §8 confidence signals.
 
     `degraded` holds node names. Until the Phase 5 guards run, every risk finding counts as
     unverified (`verified` defaults to False): the conservative default. `truncated` covers
-    malformed or missing diffs; Phase 4 adds files cut by the architecture diff budget.
+    malformed or missing diffs, and `diffs_cut`: files the route's diff budget left out of
+    the LLM call that reviews raw diffs (the architecture analyst, or the simple-path
+    synthesizer).
     """
     kept = kept_files(classifications)
     disagreement: int | None = None
@@ -256,7 +265,7 @@ def confidence_signals(
         must_review_coverage=(
             must_review_coverage(plan, files_inspected) if route.route == "complex" else None
         ),
-        truncated=any(c.is_malformed for c in kept),
+        truncated=any(c.is_malformed for c in kept) or bool(diffs_cut),
         disagreement_levels=disagreement,
         agent_hit_limit=risk_budget_exhausted,
         validation_retried=revision_count > 0,

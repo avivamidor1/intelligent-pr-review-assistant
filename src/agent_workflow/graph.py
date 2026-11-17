@@ -17,11 +17,19 @@ from typing import Literal
 
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
+from langgraph.types import RetryPolicy
 
-from . import config, nodes
+from . import config, llm, nodes
 from .state import GraphInput, GraphOutput, ReviewState
 
 ANALYSTS = ["architecture_analyst", "risk_agent"]
+
+# One retry when the model's output doesn't match the schema (§9). Only LLMSchemaError:
+# LangGraph's default retry_on would also retry our LLMRefusal and LLMError, and refusals
+# must fail fast. Transient API errors are already retried inside the SDK (config.LLM_MAX_RETRIES).
+SCHEMA_RETRY = RetryPolicy(max_attempts=config.SCHEMA_RETRY_ATTEMPTS, retry_on=llm.LLMSchemaError)
+# The single-call LLM nodes. risk_agent gets its own handling in Phase 5 (create_agent).
+LLM_NODES = ("architecture_analyst", "synthesize")
 
 
 def after_classify(state: ReviewState) -> Literal["synthesize"] | list[str]:
@@ -40,8 +48,8 @@ def build_graph() -> CompiledStateGraph:
     """Wire and compile the 7 nodes.
 
     Nodes are looked up on the `nodes` module when the graph is built, so a check or test
-    can swap an LLM node by patching `nodes.<name>` first. RetryPolicy on the LLM nodes is
-    added in Phase 4, once the exception raised on a schema mismatch has been verified.
+    can swap a node by patching `nodes.<name>` first. The LLM nodes retry a schema
+    mismatch once (SCHEMA_RETRY).
     """
     graph = StateGraph(ReviewState, input_schema=GraphInput, output_schema=GraphOutput)
     for name in (
@@ -53,7 +61,8 @@ def build_graph() -> CompiledStateGraph:
         "validate",
         "finalize",
     ):
-        graph.add_node(name, getattr(nodes, name))
+        retry = SCHEMA_RETRY if name in LLM_NODES else None
+        graph.add_node(name, getattr(nodes, name), retry_policy=retry)
 
     graph.add_edge(START, "parse_pr")
     graph.add_edge("parse_pr", "classify_pr")

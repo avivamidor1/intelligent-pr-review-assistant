@@ -6,6 +6,7 @@ return new objects and do no I/O.
 
 from __future__ import annotations
 
+import keyword
 import math
 import re
 from collections.abc import Mapping, Sequence
@@ -618,6 +619,94 @@ def build_review_plan(
         architecture_diff_budget_tokens=config.ARCH_DIFF_BUDGET_TOKENS,
         max_tool_calls=int(clamp(tool_budget, config.TOOL_BUDGET_MIN, config.TOOL_BUDGET_MAX)),
     )
+
+
+# ---------------------------------------------------------------------------
+# Inputs for the LLM nodes (§3.4, §8): API surface and diff selection
+# ---------------------------------------------------------------------------
+
+# Top-level definitions only: at column 0, so methods and nested functions are skipped.
+# Public names only: `_private` helpers aren't API (the same rule as for assignments).
+_TOP_LEVEL_DEF = re.compile(r"^(async\s+def|def|class)\s+([A-Za-z]\w*)")
+# A public module-level name being assigned (`NAME = …`, `NAME: T = …`), not compared
+# (`==`) or augmented (`+=`). An annotation must look like a type: dotted names, optional
+# [...] subscripts, joined by `|` (`int`, `dict[str, list[int]]`, `int | None`), so prose
+# in a docstring ("Note: see this = that", "Note: see https://x?a=1") isn't a name.
+# `__all__` counts: it defines the public API. Python keywords (`else: y = 2`) are skipped.
+# Known limitation (rare, accepted): a keyword argument written at column 0 inside a call
+# (`a=1,`) is indistinguishable from a valid tuple assignment and is reported as a name.
+_TYPE = r"[\w.]+(?:\[[\w\[\]., |]*\])?"
+_PUBLIC_NAME = re.compile(
+    rf"^(__all__|[A-Za-z]\w*)\s*(?::\s*{_TYPE}(?:\s*\|\s*{_TYPE})*\s*)?=(?!=)"
+)
+
+
+def _surface_item(line: str) -> tuple[str, str] | None:
+    """(kind, name) for a public top-level def/class or a public assignment, else None."""
+    if match := _TOP_LEVEL_DEF.match(line):
+        return " ".join(match.group(1).split()), match.group(2)
+    if (match := _PUBLIC_NAME.match(line)) and not keyword.iskeyword(match.group(1)):
+        return "name", match.group(1)
+    return None
+
+
+def api_surface(pr: PRInput, plan: ReviewPlan) -> list[str]:
+    """Top-level API changes in the non-filtered Python files, in ranked_files order (§3.4).
+
+    One entry per name, e.g. "src/a.py: added class RateLimiter". "changed" means the name
+    was both removed and added with a different definition line (a new signature, or
+    `def` → `async def`); identical lines on both sides are a move, not an API change, and
+    are left out. Only Python is parsed; other files contribute nothing (the prompt says
+    so). Line-based, so a `def` at column 0 inside a multi-line string is a rare accepted
+    false positive.
+    """
+    diffs = {file.path: file.diff for file in pr.changed_files}
+    entries: list[str] = []
+    for path in plan.ranked_files:
+        if not path.lower().endswith(_PYTHON_SUFFIXES) or (hunks := _hunks(diffs.get(path, ""))) is None:
+            continue
+        # name → {"+": {definition line: kind}, "-": {...}}, in first-seen order
+        sides: dict[str, dict[str, dict[str, str]]] = {}
+        for hunk in hunks:
+            for line in hunk:
+                sign, text = line[:1], line[1:].rstrip()
+                if sign in ("+", "-") and (item := _surface_item(text)) is not None:
+                    kind, name = item
+                    sides.setdefault(name, {"+": {}, "-": {}})[sign][text] = kind
+        for name, seen in sides.items():
+            added, removed = seen["+"], seen["-"]
+            if added and removed:
+                if set(added) == set(removed):
+                    continue  # moved, unchanged
+                change = "changed"
+            elif added:
+                change = "added"
+            else:
+                change = "removed"
+            kind = next(iter((added or removed).values()))  # the new kind when changed
+            entries.append(f"{path}: {change} {kind} {name}")
+    return entries
+
+
+def select_diffs(pr: PRInput, plan: ReviewPlan, budget_tokens: int) -> tuple[list[str], list[str]]:
+    """(included, cut): whole diffs of ranked_files, highest priority first, within the budget.
+
+    A file is never cut mid-diff (a partial diff reads as a different change). A file that
+    doesn't fit is skipped, and smaller lower-priority files may still use the room left.
+    Sizes are estimated with CHARS_PER_TOKEN. The cut files make the review "truncated".
+    """
+    diffs = {file.path: file.diff for file in pr.changed_files}
+    included: list[str] = []
+    cut: list[str] = []
+    used = 0
+    for path in plan.ranked_files:
+        size = math.ceil(len(diffs.get(path, "")) / config.CHARS_PER_TOKEN)
+        if used + size <= budget_tokens:
+            included.append(path)
+            used += size
+        else:
+            cut.append(path)
+    return included, cut
 
 
 # ---------------------------------------------------------------------------
