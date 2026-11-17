@@ -111,7 +111,7 @@ Filtered files are counted in the stats ("12 mechanical files skipped") and list
 - **`ranked_files`:** every non-filtered file, ordered by priority.
 - **`must_review`:** core files, sensitive paths, new modules, scan hits, and the top-5 files by priority.
 - **Budgets:**
-  - the architecture analyst's diff budget is about 40K tokens, filled in priority order,
+  - the architecture analyst's diff budget is about 150K tokens, filled with whole files in priority order (an initial value, not empirically validated; raised from 40K in Phase 4),
   - the agent's tool budget is `clamp(8 + 2 × code_files, 8, 30)` tool calls.
 
 The plan is deterministic and unit-testable, and it's written to the trace.
@@ -209,14 +209,14 @@ There is no GitHub access, which the assignment requires, so the system **never 
 One Claude model means one prompt cache and one set of behaviours to handle. Models, effort levels and the Jev threshold are set in `config.py` and can be overridden from the environment (`MODEL_MAIN`, `JEV_THRESHOLD`).
 
 ### Claude API behaviours that shape the code
-1. **Thinking is always on,** and `effort` is the control. Every node sets its effort explicitly.
+1. **Thinking is always on,** and `effort` is the control. Every node sets its effort explicitly. (`langchain-anthropic` sends `thinking: {type: "adaptive", display: "summarized"}` whenever effort is set; that's valid and billed the same. Thinking is never *disabled*, which is a 400. Checked in Phase 4.1.)
 2. **No `temperature`/`top_p`** (they return a 400). Consistency comes from the deterministic nodes and strict schemas.
 3. **Forced tool choice returns a 400,** so structured output must use **native JSON-schema structured outputs**:
    - the single-call nodes use `with_structured_output(method="json_schema")`,
    - the agent uses `response_format=ProviderStrategy(RiskFindings)`. **`ToolStrategy` is not used**, because it binds the tools with `tool_choice="any"` (checked in the `langchain` 1.4.9 source). `langchain-anthropic` 1.7.10 maps `ProviderStrategy` to Anthropic's `output_config.format`.
-   - *Verify at implementation:* that the native format works alongside tool calls and thinking on a real run.
+   - *Verified in Phase 4 (4.1, 4.10):* the native format works with thinking on real calls, for both single-call schemas. *Still to verify in Phase 5:* that it works alongside tool calls in the agent.
 4. **Refusals** (`stop_reason: "refusal"`) can be false positives on security-related diffs. Enable the server-side fallback (`fallbacks: "default"`). A final refusal is handled as a degraded stage. In the agent, `ModelRefusalMiddleware` turns it into an error, so it can't be mistaken for a final answer.
-5. **Prompt caching:** static content (instructions, project context) goes first, and PR content last. In the agent, `AnthropicPromptCachingMiddleware` tags the system prompt and the tool definitions and caches the message tail, so the growing history is cached on every turn. The single-call nodes put a `cache_control` breakpoint on the system prompt. *Verify the cache hits in the usage metadata at implementation.*
+5. **Prompt caching:** static content (instructions, project context) goes first, and PR content last. In the agent, `AnthropicPromptCachingMiddleware` tags the system prompt and the tool definitions and caches the message tail, so the growing history is cached on every turn. The single-call nodes put a `cache_control` breakpoint on the system prompt. *Verified in Phase 4:* writes and reads show in the API's usage fields (4.1: 3,576 tokens written, then read). LangChain's `usage_metadata` reports a 5-minute write as `cache_creation: 0`, so `llm.py` uses the raw usage fields.
 6. **Thinking blocks in the tool loop:** with thinking on, each assistant turn must be sent back unchanged, thinking blocks included, or the API rejects the next request. `create_agent` appends the model's `AIMessage` to the state as-is, and none of our middleware rewrites messages. *Verify on a multi-turn run in Phase 5.*
 7. **`max_tokens` of about 16K** per call, because thinking counts toward it.
 8. **1M context:** even huge PRs fit. The budgets exist for **focus and cost**, not to fit the window.
@@ -395,9 +395,9 @@ It's built in plain code by the wrapper node, from the PR overview and `must_rev
 
 ### `synthesize`
 - **Input:**
-  - **simple path:** the PR overview plus the diffs, in priority order, within about 20K tokens,
+  - **simple path:** the PR overview plus the diffs, in priority order, within about 100K tokens (an initial value, not empirically validated; raised from 20K in Phase 4). Simple code PRs are ≤ 50 lines, so only a large docs-only PR can reach it,
   - **complex path:** the findings and stats only, never raw diffs.
-- **Output:** `ReviewDraft`, containing `risk_level`, `risk_reasoning`, `architectural_impact`, `review_focus_areas` (`{file, concern}`, ordered, 1–6 items), `confidence` and `confidence_reasoning`.
+- **Output:** `ReviewDraft`, containing `risk_level`, `risk_reasoning`, `architectural_impact`, `review_focus_areas` (`{file, concern}`, ordered, 1–6 items), `confidence` and `confidence_reasoning`. The schema enforces only "at least 1 focus area", the one limit the API's structured output enforces. The 6-item maximum and the 0–1 confidence range are asked for in the prompt and enforced in `finalize` (extra areas cut, with a trace line; confidence clamped), so a slip doesn't end the run. `ReviewOutput` keeps every limit (Phase 4, decision D4).
 - **Risk rubric:**
   - **high:** security, a breaking public API change, or a risky change on a core hot path without tests,
   - **medium:** a core-path change, new shared state, or a concurrency or deployment concern,
@@ -436,7 +436,7 @@ Each repair is written to the trace (`Repair: …`), and confidence is capped at
 
 Each term is clamped to `[0, max]`, and rounding is half-up. Example: the sample PR scores 5.5 and a docs typo scores 1.0. The weights live in config, and the README notes that the score measures structure, not subtlety.
 
-**`confidence` (0–1):** start from the LLM's value. **Subtract the penalties**, then **apply the caps with `min()`**, then clamp to [0.1, 0.95].
+**`confidence` (0–1):** start from the LLM's value, clamped to [0, 1] (the prompt asks for 0–1 and the schema doesn't enforce it, D4; a value is never read as a percentage). **Subtract the penalties**, then **apply the caps with `min()`**, then clamp to [0.1, 0.95].
 
 | Signal | Effect |
 |---|---|
@@ -501,7 +501,7 @@ A routing fallback is a **safe default, not a degradation**. The review is still
 | Failure | Handled by |
 |---|---|
 | 429, 5xx, timeout, connection error | Anthropic SDK `max_retries=3` with exponential backoff |
-| Output doesn't match the schema | Node `RetryPolicy(max_attempts=2)`, retrying only on validation errors |
+| Output doesn't match the schema | Node `RetryPolicy(max_attempts=2)`, retrying only on `llm.LLMSchemaError` |
 | 400 / 401 / 403 | Fail fast |
 | Refusal | Server-side fallback (§5), then degraded. In the agent, `ModelRefusalMiddleware` raises the error. |
 
@@ -537,7 +537,7 @@ A routing fallback is a **safe default, not a degradation**. The review is still
 4. **Cheap decisions first:** the rules are free, and Jev is called only for the uncertain middle.
 5. **Prompt caching:** static-first prompt order, plus `AnthropicPromptCachingMiddleware` in the agent loop, so each turn reuses the cached history.
 6. **Budgets that scale with the PR,** within hard caps.
-7. **Usage accounting:** tokens in/out and estimated cost go into the trace, which works without Langfuse.
+7. **Usage accounting:** tokens in/out and estimated cost go into the trace, which works without Langfuse. One line per LLM call, from `llm.Usage.trace_line` (Phase 4). The cost is an estimate from Opus 5.5 list prices in `config.py`.
 
 ---
 
@@ -573,7 +573,7 @@ README.md
 docs/PLAN.md
 src/agent_workflow/
   config.py          # models, effort per node, routing thresholds, Jev threshold, weights, budgets
-  llm.py             # Claude factory: ChatAnthropic, effort, fallbacks, structured-output helper
+  llm.py             # the LLM boundary: provider-neutral structured_call, Usage, LLMError family; Claude (ChatAnthropic, effort, fallbacks, caching) behind it
   router.py          # classify_pr: hard rules, Jev client, fallback
   schemas.py         # Pydantic models (raw input, file classification, stats, plan, route decision, findings, draft, output)
   state.py           # ReviewState + reducers

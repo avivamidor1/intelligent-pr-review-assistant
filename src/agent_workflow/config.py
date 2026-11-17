@@ -6,8 +6,8 @@ Design: docs/PLAN.md §3.1 (noise filter, categories), §3.2 (priority, review p
 Every number and path pattern used by the deterministic layer is defined here, once.
 Regexes that are part of a parsing or scanning algorithm (diff hunks, import lines,
 secret and injection rules) live in preprocessing.py, next to the code that uses them.
-Models, effort levels, the Jev threshold and environment overrides are added in
-Phases 4 and 6, when something uses them.
+The model, effort levels and LLM limits are in the LLM section (Phase 4); the Jev
+threshold is added in Phase 6.
 
 The values come from PLAN.md. Most are judgment calls, not measured on real PRs, and the
 comments say what each one is meant to achieve. Two ideas run through all of them:
@@ -99,11 +99,26 @@ PRIORITY_WEIGHT_DOCS: Final = -2.0
 # the smallest tool budget (8), with 3 calls left for searches.
 MUST_REVIEW_TOP_N: Final = 5
 
-# The diff budget for the architecture analyst's single LLM call, filled in priority order.
-# 40K tokens ≈ 160K characters ≈ a few thousand diff lines: enough for full diffs of a
-# typical feature PR, while the cost per call stays bounded. Larger PRs are covered by the
-# ranked file list and the API-surface extraction (§3.4).
-ARCH_DIFF_BUDGET_TOKENS: Final = 40_000
+# Diff budgets for the two LLM calls that see raw diffs, filled with whole files in priority
+# order. INITIAL VALUES, not empirically validated: no cost, latency or quality measurement
+# on large PRs backs them yet. They're caps, not spend (a PR below them costs the same at
+# any cap), and they exist for focus and cost, not to fit the 1M context (§5). Whatever
+# doesn't fit is named in the prompt and the trace, and caps confidence as truncated (§8).
+#
+# Architecture analyst: 150K tokens ≈ 600K characters ≈ 15K diff lines, so only very large
+# PRs are cut; worst case ≈ $0.60 of uncached input per call at list price. What's cut is
+# still covered by the API surface (all Python files) and by the risk agent, which reads
+# any diff on demand (§3.4). Chosen in Phase 4 (docs/phases.md, budget decision).
+ARCH_DIFF_BUDGET_TOKENS: Final = 150_000
+
+# Simple-path synthesizer (§8): simple code PRs are ≤ 50 changed lines (routing rules), so
+# only a large docs-only PR can reach this. 100K keeps such docs in the review, at low
+# effort. Chosen in Phase 4 (docs/phases.md, budget decision).
+SYNTH_SIMPLE_DIFF_BUDGET_TOKENS: Final = 100_000
+
+# The complex-path synthesizer gets at most this many findings, highest severity first, plus
+# counts of the rest (§3.4): enough to judge the PR without burying the strongest evidence.
+SYNTH_MAX_FINDINGS: Final = 15
 
 # Risk-agent tool budget: clamp(BASE + PER_CODE_FILE × code_files, MIN, MAX).
 # BASE: room for a few reads and searches, even on a tiny PR.
@@ -218,6 +233,42 @@ CONF_MAX: Final = 0.95
 # Deterministic fallback review (§9): rule-based facts only, with no reasoning about
 # behaviour. It sits just above the floor, because its facts are still correct.
 FALLBACK_CONFIDENCE: Final = 0.2
+
+# ---------------------------------------------------------------------------
+# LLM (§5, §9, §10). Values checked against the installed SDKs in Phase 4.1.
+# ---------------------------------------------------------------------------
+
+# One Claude model for every node: one prompt cache and one set of behaviours (§5).
+# The MODEL_MAIN environment variable overrides it; llm.py reads it at call time, after
+# .env is loaded, so the override works from .env too.
+MODEL_MAIN: Final = "claude-opus-5-5"
+
+# Effort per call (§5). Thinking can't be disabled on Opus 5.5 and its default effort is
+# "medium", so every call sets one explicitly. The risk agent's ("high") comes in Phase 5.
+EFFORT_ARCHITECTURE: Final = "medium"  # one focused judgment call
+EFFORT_SYNTH_SIMPLE: Final = "low"  # a small diff that needs a short review
+EFFORT_SYNTH_COMPLEX: Final = "medium"  # merges findings that already exist
+
+# Per call. Thinking counts toward it, so not lower; non-streaming calls stay under the
+# SDK's HTTP timeout at this size (§5).
+LLM_MAX_TOKENS: Final = 16_000
+# Transient errors (429, 5xx, timeouts, connection) are retried by the Anthropic SDK with
+# exponential backoff (§9).
+LLM_MAX_RETRIES: Final = 3
+# A schema mismatch is retried by the node's RetryPolicy: 2 attempts = 1 retry (§9).
+SCHEMA_RETRY_ATTEMPTS: Final = 2
+
+# Server-side refusal fallback (§5): on a refusal, the API re-runs the request on a fallback
+# model it picks by refusal category ("default"), inside the same call.
+FALLBACK_BETA: Final = "server-side-fallback-2026-07-01"
+FALLBACK_MODE: Final = "default"
+
+# List prices for claude-opus-5-5, $ per million tokens (checked 2026-11). Used only for the
+# cost estimate in the trace, never for billing. A 5-minute cache write is 1.25× input.
+PRICE_INPUT_PER_MTOK: Final = 4.00
+PRICE_OUTPUT_PER_MTOK: Final = 20.00
+PRICE_CACHE_READ_PER_MTOK: Final = 0.20
+PRICE_CACHE_WRITE_PER_MTOK: Final = 5.00
 
 # ---------------------------------------------------------------------------
 # Misc
