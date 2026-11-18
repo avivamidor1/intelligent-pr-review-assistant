@@ -28,7 +28,8 @@ ANALYSTS = ["architecture_analyst", "risk_agent"]
 # LangGraph's default retry_on would also retry our LLMRefusal and LLMError, and refusals
 # must fail fast. Transient API errors are already retried inside the SDK (config.LLM_MAX_RETRIES).
 SCHEMA_RETRY = RetryPolicy(max_attempts=config.SCHEMA_RETRY_ATTEMPTS, retry_on=llm.LLMSchemaError)
-# The single-call LLM nodes. risk_agent gets its own handling in Phase 5 (create_agent).
+# The single-call LLM nodes. risk_agent has no node retry (D4): re-running the whole agent
+# would repeat its history; a final answer that doesn't parse gets the recovery call instead.
 LLM_NODES = ("architecture_analyst", "synthesize")
 
 

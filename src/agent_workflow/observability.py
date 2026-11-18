@@ -11,6 +11,11 @@ inside a node (Claude calls, the risk agent's tool calls) nests under it, becaus
 passes the run's callbacks down to child runs.
 
 The local server lives in `langfuse/` (docker compose); LANGFUSE_BASE_URL points at it.
+
+Each Claude call is exported once: the Anthropic SDK also emits its own OpenTelemetry span
+for every request, and Langfuse's default filter exports it (it has `gen_ai.*`
+attributes), which showed every call twice and doubled the trace's cost (Phase 4.10, F2).
+`should_export_span` keeps Langfuse's default rule and drops only that scope.
 """
 
 from __future__ import annotations
@@ -25,15 +30,34 @@ from langchain_core.runnables import RunnableConfig
 
 _REQUIRED_ENV = ("LANGFUSE_PUBLIC_KEY", "LANGFUSE_SECRET_KEY", "LANGFUSE_BASE_URL")
 
+# The Anthropic SDK's own OpenTelemetry scope: a duplicate of the LangChain generation.
+ANTHROPIC_SDK_SCOPE = "com.anthropic.sdk.python"
+
+
+def should_export_span(span: Any) -> bool:
+    """Langfuse's default export rule, minus the Anthropic SDK's own spans (and its
+    sub-scopes). A custom filter replaces Langfuse's default (checked in the 5.2.0 source,
+    span_processor.py), so the default is called here rather than dropped."""
+    from langfuse.span_filter import is_default_export_span
+
+    scope = span.instrumentation_scope.name if span.instrumentation_scope is not None else ""
+    if scope == ANTHROPIC_SDK_SCOPE or scope.startswith(f"{ANTHROPIC_SDK_SCOPE}."):
+        return False
+    return is_default_export_span(span)
+
 
 def get_langfuse_handler() -> Any | None:
     """Langfuse's LangChain CallbackHandler, or None when tracing is off."""
     if not all(os.getenv(name) for name in _REQUIRED_ENV):
         return None
     try:
+        from langfuse import Langfuse
         from langfuse.langchain import CallbackHandler
     except ImportError:  # keys set, but the dev group isn't installed
         return None
+    # Create the client first, with the span filter: the handler (and traced_run's
+    # get_client) reuse this client, configured from the same environment variables.
+    Langfuse(should_export_span=should_export_span)
     return CallbackHandler()
 
 

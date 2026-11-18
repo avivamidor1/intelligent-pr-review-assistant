@@ -10,10 +10,13 @@ Trace lines are plain sentences; `finalize` numbers them. `degraded` holds node 
 
 from __future__ import annotations
 
+import operator
+from functools import reduce
 from typing import Any
 
 from . import config, llm, prompts
 from .preprocessing import api_surface, load_core_patterns, preprocess, select_diffs
+from .risk_agent import RiskRun, apply_guards, run_risk_agent
 from .router import decide_route, describe_paths, describe_route
 from .schemas import ArchitectureFindings, PRInput, ReviewDraft, ReviewOutput
 from .scoring import (
@@ -98,8 +101,7 @@ def classify_pr(state: ReviewState) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# LLM nodes. An LLM failure raises until Phase 7 adds degradation; risk_agent is a stub
-# until Phase 5.
+# LLM nodes. An LLM failure raises until Phase 7 adds degradation.
 # ---------------------------------------------------------------------------
 
 
@@ -125,19 +127,58 @@ def architecture_analyst(state: ReviewState) -> dict[str, Any]:
 
 
 def risk_agent(state: ReviewState) -> dict[str, Any]:
-    """The ReAct risk agent (§7). STUB: replaced in Phase 5.
-
-    It doesn't run, so it reports no result (`risk=None`): the synthesizer is told the risk
-    review is "not available", never that it completed and found nothing. Nothing is read,
-    so files_inspected stays empty and the coverage cap applies, honestly.
-    """
-    # STUB: replaced in Phase 5.
+    """The ReAct risk agent (§7): run it with this PR's budgets, then the hallucination
+    guards. Only the findings, the files it read and the budget flag go back to the state;
+    the agent's message history is discarded (§6). No node retry (D4): a final answer that
+    doesn't parse already gets the recovery call inside the run."""
+    run = run_risk_agent(state)
+    risk, guard_lines = apply_guards(run.findings, state["pr"])
+    verified = sum(f.verified for f in risk.findings)
+    if run.files_inspected:
+        read_line = f"Risk agent: read {describe_paths('file', run.files_inspected)}."
+    else:
+        read_line = "Risk agent: read no file diffs in full."
+    trace = [
+        f"Risk agent: budget {run.max_tool_calls} tool calls, {run.max_model_calls} model calls.",
+        _tool_line(run),
+        read_line,
+    ]
+    if run.files_partly_read:
+        trace.append(
+            f"Risk agent: read only some pages of {describe_paths('file', run.files_partly_read)}; "
+            "not counted as inspected."
+        )
+    if run.recovery_reason == "model_call_limit":
+        trace.append(f"Risk agent: stopped by the model-call limit ({run.max_model_calls}); recovery call made.")
+    elif run.recovery_reason == "unparsed_answer":
+        trace.append("Risk agent: final answer didn't parse; recovery call made.")
+    trace += guard_lines
+    trace.append(
+        f"Risk agent: {len(risk.findings)} finding(s), {verified} verified, "
+        f"max severity {risk.max_severity or 'none'}."
+    )
+    if run.usage:  # one summed line for the agent's calls (D3)
+        total = reduce(operator.add, run.usage)
+        trace.append(total.trace_line(f"risk_agent ({len(run.usage)} calls)"))
+    if run.recovery_usage is not None:
+        trace.append(run.recovery_usage.trace_line("risk_agent recovery"))
     return {
-        "risk": None,
-        "files_inspected": [],
-        "risk_budget_exhausted": False,
-        "reasoning_trace": ["Risk agent: stub, not run (Phase 5); no risk review."],
+        "risk": risk,
+        "files_inspected": run.files_inspected,
+        "risk_budget_exhausted": run.budget_exhausted,
+        "reasoning_trace": trace,
     }
+
+
+def _tool_line(run: RiskRun) -> str:
+    """Tool names and counts only, never arguments: a search pattern could quote a secret."""
+    total = sum(run.tool_calls.values())
+    counts = ", ".join(f"{name} ×{n}" for name, n in run.tool_calls.items())
+    detail = f" ({counts})" if counts else ""
+    return (
+        f"Risk agent: {total} tool call(s){detail}; {run.blocked_calls} blocked by the budget; "
+        f"{run.tool_errors} tool error(s)."
+    )
 
 
 def synthesize(state: ReviewState) -> dict[str, Any]:

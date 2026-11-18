@@ -71,6 +71,12 @@ def normalize_path(path: str) -> str:
     return path.lstrip("/")
 
 
+def changed_files_by_path(pr: PRInput) -> dict[str, ChangedFile]:
+    """The PR's files by normalised path: the one rule for matching a path the model wrote
+    (the agent's tools and the hallucination guards both use it)."""
+    return {normalize_path(f.path): f for f in pr.changed_files}
+
+
 def _matches_name(path: str, globs: Sequence[str]) -> bool:
     """fnmatch globs against the basename, case-insensitive (e.g. `*.md` matches `NOTES.MD`)."""
     name = normalize_path(path).rsplit("/", 1)[-1].lower()
@@ -160,6 +166,21 @@ def _hunks(diff: str) -> list[list[str]] | None:
         elif in_hunk:
             hunks[-1].append(line)
     return hunks or None
+
+
+def diff_body_lines(diff: str) -> list[str]:
+    """The diff's content lines without their +, - or space marker: the lines inside hunks,
+    never file or hunk headers. A diff with no hunk (malformed raw text) gives its lines as
+    they are. Used to check quoted evidence (risk_agent.evidence_in_diff)."""
+    hunks = _hunks(diff)
+    if hunks is None:
+        return _split_lines(diff)
+    return [line[1:] for hunk in hunks for line in hunk]
+
+
+def hunk_headers(diff: str) -> list[tuple[int, str]]:
+    """Every `@@` header with its 1-based line number in the diff text (for the agent's tools)."""
+    return [(n, line) for n, line in enumerate(_split_lines(diff), start=1) if _HUNK_HEADER.match(line)]
 
 
 def _change_blocks(hunk: list[str]) -> list[tuple[list[str], list[str]]]:
@@ -592,6 +613,14 @@ def compute_stats(
     )
 
 
+def ranked_paths(classifications: Mapping[str, FileClassification]) -> list[str]:
+    """Non-filtered files, highest priority first, then by path: the review order.
+
+    The single definition, used by the review plan (`ranked_files`) and the agent's tools.
+    """
+    return [c.path for c in sorted(kept_files(classifications), key=lambda c: (-c.priority, c.path))]
+
+
 def build_review_plan(
     classifications: Mapping[str, FileClassification], stats: PRStats
 ) -> ReviewPlan:
@@ -602,7 +631,7 @@ def build_review_plan(
     ones). A filtered file is only included through a scan hit (choice: nothing to review).
     """
     kept = kept_files(classifications)
-    ranked = [c.path for c in sorted(kept, key=lambda c: (-c.priority, c.path))]
+    ranked = ranked_paths(classifications)
     top = set(ranked[: config.MUST_REVIEW_TOP_N])
     flagged = {c.path for c in kept if c.is_core or c.is_sensitive or c.is_new_module}
     hit_files = {hit.file for hit in stats.scan_hits if hit.file is not None}

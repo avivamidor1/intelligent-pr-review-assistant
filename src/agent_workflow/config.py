@@ -6,8 +6,8 @@ Design: docs/PLAN.md §3.1 (noise filter, categories), §3.2 (priority, review p
 Every number and path pattern used by the deterministic layer is defined here, once.
 Regexes that are part of a parsing or scanning algorithm (diff hunks, import lines,
 secret and injection rules) live in preprocessing.py, next to the code that uses them.
-The model, effort levels and LLM limits are in the LLM section (Phase 4); the Jev
-threshold is added in Phase 6.
+The model, effort levels and LLM limits are in the LLM section (Phase 4), the risk
+agent's limits in their own section (Phase 5); the Jev threshold is added in Phase 6.
 
 The values come from PLAN.md. Most are judgment calls, not measured on real PRs, and the
 comments say what each one is meant to achieve. Two ideas run through all of them:
@@ -244,10 +244,11 @@ FALLBACK_CONFIDENCE: Final = 0.2
 MODEL_MAIN: Final = "claude-opus-5-5"
 
 # Effort per call (§5). Thinking can't be disabled on Opus 5.5 and its default effort is
-# "medium", so every call sets one explicitly. The risk agent's ("high") comes in Phase 5.
+# "medium", so every call sets one explicitly.
 EFFORT_ARCHITECTURE: Final = "medium"  # one focused judgment call
 EFFORT_SYNTH_SIMPLE: Final = "low"  # a small diff that needs a short review
 EFFORT_SYNTH_COMPLEX: Final = "medium"  # merges findings that already exist
+EFFORT_RISK_AGENT: Final = "high"  # multi-step tool use and the hardest reasoning (also its recovery call)
 
 # Per call. Thinking counts toward it, so not lower; non-streaming calls stay under the
 # SDK's HTTP timeout at this size (§5).
@@ -269,6 +270,74 @@ PRICE_INPUT_PER_MTOK: Final = 4.00
 PRICE_OUTPUT_PER_MTOK: Final = 20.00
 PRICE_CACHE_READ_PER_MTOK: Final = 0.20
 PRICE_CACHE_WRITE_PER_MTOK: Final = 5.00
+
+# ---------------------------------------------------------------------------
+# Risk agent (§7). Its tool budget comes from the review plan (TOOL_BUDGET_* above).
+# ---------------------------------------------------------------------------
+
+# max_model_calls = max_tool_calls + MODEL_CALL_SLACK. Every non-final turn uses at least
+# one tool call, so the tool budget is the real cost limit, and this is only a backstop:
+# one call to answer after the last tool result, plus one for a turn whose tools were all
+# blocked. A tighter value would end normal one-tool-per-turn runs before the tool budget
+# is spent, with no answer.
+MODEL_CALL_SLACK: Final = 2
+
+# LangGraph steps one model→tools turn takes in the agent with our middleware (measured
+# in Phase 5.1: k tool turns then an answer need 5k + 5 steps; a run the model-call limit
+# ends after m calls needs 5m + 2, the worst case). recursion_limit =
+# RISK_AGENT_STEPS_PER_TURN × (max_model_calls + 1), passed in the run's config because
+# create_agent defaults to 9,999. It should never trigger: the two call limits stop the run first.
+RISK_AGENT_STEPS_PER_TURN: Final = 5
+
+# Tool output bounds (§3.5, §7). Every tool is a bounded read over the PR.
+# Every tool result (error messages included) is at most this many characters. The tools
+# stay under it by design; a final cut enforces it for pathological input (a huge path).
+TOOL_RESULT_MAX_CHARS: Final = 20_000
+# The agent's executed tool output in one run is then at most TOOL_BUDGET_MAX ×
+# TOOL_RESULT_MAX_CHARS characters (~150–200K tokens, well inside the model's 1M window);
+# a test keeps the product at or under this ceiling. Calls the budget blocks get a short
+# fixed message from the middleware.
+TOOL_OUTPUT_TOTAL_MAX_CHARS: Final = 600_000
+# A read_file_diff page ends after this many lines, or before its text (page 1: with the
+# hunk-header list) would pass TOOL_PAGE_MAX_CHARS, whichever comes first. Every line is on
+# some page. Normal code (~40 characters a line) fills the line limit first.
+TOOL_DIFF_PAGE_LINES: Final = 400
+TOOL_PAGE_MAX_CHARS: Final = 18_000
+SEARCH_DIFF_MAX_HITS: Final = 50  # search_diff stops here and says the rest were cut
+# One hit line is cut to this length: a minified or generated line could otherwise make a
+# single search result enormous.
+SEARCH_HIT_MAX_CHARS: Final = 200
+# Each line read_file_diff shows is cut to this length, with the number of characters cut,
+# so one minified line can't put megabytes into a page. Normal code lines are far shorter.
+TOOL_LINE_MAX_CHARS: Final = 500
+# Page 1 of read_file_diff lists at most this many hunk headers, with the page each is on
+# (then "+N more"), each cut to TOOL_HUNK_HEADER_MAX_CHARS (git itself keeps the function
+# context short). Enough to navigate a large file, bounded for one with thousands of hunks.
+TOOL_MAX_HUNK_HEADERS: Final = 50
+TOOL_HUNK_HEADER_MAX_CHARS: Final = 120
+# search_diff rejects a pattern before compiling it if it is longer than this, or if its
+# counted repeats ({n}, {m,n}) multiply to more than SEARCH_REPEAT_PRODUCT_MAX. The `regex`
+# timeout only covers matching; compiling expands counted repeats, so a short pattern like
+# (?:x{60000}){60000} could exhaust memory first. Measured in the Phase 5.12 review: at
+# these limits the worst pattern compiles in < 0.1 s and ~125 MB.
+SEARCH_PATTERN_MAX_CHARS: Final = 500
+SEARCH_REPEAT_PRODUCT_MAX: Final = 1_000
+# A search_diff call stops after this many seconds of regex matching in total and tells the
+# agent to simplify the pattern. The pattern is model-written and runs over untrusted PR text,
+# so catastrophic backtracking must not hang the review; the `regex` package enforces it
+# inside the matching engine (Python's `re` has no timeout). Plain searches over a large PR
+# take milliseconds.
+SEARCH_DIFF_TIMEOUT_SECONDS: Final = 2.0
+TOOL_PATH_SUGGESTIONS: Final = 3  # closest changed paths offered for an unknown path (difflib)
+
+# Findings the agent is asked for at most (a prompt instruction, not enforced). Enough for a
+# large PR's real risks while keeping its final answer, and the synthesizer's input, short.
+RISK_AGENT_MAX_FINDINGS: Final = 8
+
+# The hallucination guards (§7) verify evidence only if it has at least this many characters
+# after normalising whitespace. Shorter evidence ("=", "return x") is found in almost any
+# diff, so it proves nothing; the finding stays unverified and is lowered one level.
+MIN_EVIDENCE_CHARS: Final = 12
 
 # ---------------------------------------------------------------------------
 # Misc
