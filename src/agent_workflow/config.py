@@ -7,7 +7,7 @@ Every number and path pattern used by the deterministic layer is defined here, o
 Regexes that are part of a parsing or scanning algorithm (diff hunks, import lines,
 secret and injection rules) live in preprocessing.py, next to the code that uses them.
 The model, effort levels and LLM limits are in the LLM section (Phase 4), the risk
-agent's limits in their own section (Phase 5); the Jev threshold is added in Phase 6.
+agent's limits in their own section (Phase 5), and the Jev router's in theirs (Phase 6).
 
 The values come from PLAN.md. Most are judgment calls, not measured on real PRs, and the
 comments say what each one is meant to achieve. Two ideas run through all of them:
@@ -135,7 +135,8 @@ TOOL_BUDGET_MAX: Final = 30
 # Hard routing rules (§3.3); above either limit routes complex
 # What "a small change" means. Above these limits, rules can't call a PR trivial, and
 # a full review costs little compared with a missed risk. At or below them (with nothing
-# core, sensitive or new), the PR is the "uncertain middle" that Jev decides in Phase 6.
+# core, sensitive or new), the PR is the "uncertain middle" that Jev decides (the Jev
+# router section below).
 # ---------------------------------------------------------------------------
 
 MAX_CODE_FILES: Final = 3
@@ -338,6 +339,56 @@ RISK_AGENT_MAX_FINDINGS: Final = 8
 # after normalising whitespace. Shorter evidence ("=", "return x") is found in almost any
 # diff, so it proves nothing; the finding stays unverified and is lowered one level.
 MIN_EVIDENCE_CHARS: Final = 12
+
+# ---------------------------------------------------------------------------
+# Jev router (§3.3 layer 2, §9 routing failures). Values checked on the real API in
+# Phase 6.1. Jev is optional: without JEV_API_KEY the uncertain middle routes complex, and
+# PR content is sent to Jev only when the key is set.
+# ---------------------------------------------------------------------------
+
+JEV_BASE_URL: Final = "https://api.typesafe.ai"
+JEV_ENDPOINT: Final = "/v1/systemone"
+# Pinned: `jev-latest` is an alias that moves when TypeSafe ships a release, which would change
+# routing with no code change. The response's `model` field confirms what answered (6.1).
+JEV_MODEL: Final = "jev-1.14.0"
+# Our name for the single yes/no question (a Noul). It's phrased so that "yes" means simple,
+# so the answer is P(simple) directly.
+JEV_QUESTION: Final = "light_review_enough"
+
+# P(simple) at or above this routes simple, anything below routes complex. Higher than the
+# docs' 0.7 starting point on purpose: a needless full review costs cents, a risky PR on the
+# light path is a missed risk. The JEV_THRESHOLD environment variable overrides it, read at
+# call time, and must lie in [JEV_THRESHOLD_MIN, 1.0]: below 0.5 would route simple when Jev
+# leans complex, and 1.0 effectively turns Jev's downgrade off. Not tuned on the 6.1 cases.
+JEV_THRESHOLD: Final = 0.85
+JEV_THRESHOLD_MIN: Final = 0.5
+
+# httpx applies this to each phase of a request (connect, write, read, pool) and restarts the
+# read timer on every chunk received. It is not a deadline for the whole request: a slow
+# connect plus a slow write plus a read that trickles bytes can take longer, and there's no
+# overall cap (that would need a thread or async; accepted, Phase 6.10 CR4). Measured: a
+# whole request takes 0.20–0.71 s (6.1, 6.6).
+JEV_TIMEOUT_SECONDS: Final = 3.0
+# 2 attempts = 1 immediate retry, only on a timeout, a connection error or a 5xx. A 4xx (429
+# included) routes complex at once: the router can't usefully wait out a rate limit, and
+# complex is the safe, cheap default.
+JEV_MAX_ATTEMPTS: Final = 2
+
+# Payload bounds (§3.3: about 2K tokens; the 6.1 payloads were 1.2–1.4K characters, ~600
+# tokens). The title and description are cut with a marker; a title is normally one line, so
+# its limit is small. The file list keeps the code files first. Code hunks over
+# JEV_DIFF_MAX_CHARS mean Jev isn't asked (router.jev_request says why).
+JEV_TITLE_MAX_CHARS: Final = 300
+JEV_DESCRIPTION_MAX_CHARS: Final = 1_500
+JEV_MAX_FILES_LISTED: Final = 20
+JEV_DIFF_MAX_CHARS: Final = 8_000  # ≈ 2K tokens at CHARS_PER_TOKEN
+# A model name in a warning (Jev answered with another model) is cut to this length: it's
+# response text, so it's bounded like everything else that reaches the trace.
+JEV_MODEL_NAME_MAX_CHARS: Final = 60
+
+# List price for jev-1.14.0, $ per million input tokens; output tokens are free (checked
+# 2026-11). Used only for the cost estimate in the trace, never for billing.
+JEV_PRICE_INPUT_PER_MTOK: Final = 0.042
 
 # ---------------------------------------------------------------------------
 # Misc

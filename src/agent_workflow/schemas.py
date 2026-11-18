@@ -136,6 +136,30 @@ class RouteDecision(BaseModel):
     reason: str
 
 
+# The Jev response (§3.3), as seen on the real API in Phase 6.1:
+# {"model": "jev-1.14.0", "answers": {"<question>": {"type": "noul", "noul": 0.98}},
+#  "usage": {"input_tokens": 615, "output_tokens": 23}}
+# Validated strictly, so a malformed answer routes complex instead of being guessed at:
+# `noul` must be a JSON number in [0, 1] (not true, "0.9" or NaN).
+class JevNoul(BaseModel):
+    type: Literal["noul"]
+    noul: float = Field(strict=True, ge=0, le=1, allow_inf_nan=False)
+
+
+class JevUsage(BaseModel):
+    """Only for the trace's cost line, so it's best-effort: a missing count never discards
+    a valid answer (Phase 6.10, CR5)."""
+
+    input_tokens: NonNegativeInt | None = None
+    output_tokens: NonNegativeInt | None = None
+
+
+class JevResponse(BaseModel):
+    model: str
+    answers: dict[str, JevNoul]
+    usage: JevUsage | None = None
+
+
 class Finding(BaseModel):
     file: str
     description: str

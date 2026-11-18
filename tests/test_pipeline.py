@@ -19,16 +19,17 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+import httpx
 import pytest
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
 
-from agent_workflow import config, llm, nodes, prompts, risk_agent, tools
+from agent_workflow import config, llm, nodes, prompts, risk_agent, router, tools
 from agent_workflow.graph import build_graph
 from agent_workflow.observability import get_langfuse_handler, traced_run
-from agent_workflow.preprocessing import api_surface, load_core_patterns, preprocess, select_diffs
-from agent_workflow.router import apply_hard_rules, decide_route
+from agent_workflow.preprocessing import api_surface, hunks_text, load_core_patterns, preprocess, select_diffs
+from agent_workflow.router import JEV_CRITERIA, JEV_INSTRUCTIONS, apply_hard_rules, decide_route, jev_request
 from agent_workflow.schemas import (
     ArchitectureFindings,
     Finding,
@@ -113,6 +114,20 @@ class MustReviewReader(BaseChatModel):
                     for i, p in enumerate(paths)
                 ])
         return ChatResult(generations=[ChatGeneration(message=reply)])
+
+
+@pytest.fixture(autouse=True)
+def no_jev(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No test reaches the real Jev, even with a key in the developer's environment: no key,
+    no threshold override, and a transport that fails the test if it's called. A test that
+    needs Jev sets the key and patches `router._jev_transport` itself."""
+    monkeypatch.delenv("JEV_API_KEY", raising=False)
+    monkeypatch.delenv("JEV_THRESHOLD", raising=False)
+
+    def refuse(request: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"unexpected Jev request: {request.url}")
+
+    monkeypatch.setattr(router, "_jev_transport", lambda: httpx.MockTransport(refuse))
 
 
 @pytest.fixture(autouse=True)
@@ -330,7 +345,7 @@ def test_repair_failed_draft(
     repaired, trace = repair_draft(
         draft,
         classifications=result.classifications,
-        route=decide_route(result.classifications, result.stats),
+        route=decide_route(result.pr, result.classifications, result.stats)[0],
         plan=result.plan,
         risk=None,
         scan_hits=result.stats.scan_hits,
@@ -1299,3 +1314,296 @@ def test_risk_agent_pages_read(monkeypatch: pytest.MonkeyPatch) -> None:
                _calls(_read("src/big.py", page=2)))
     assert full["files_inspected"] == ["src/big.py", "src/small.py"]  # order of first reads
     assert not any("only some pages" in line for line in full["reasoning_trace"])
+
+
+# ---------------------------------------------------------------------------
+# Jev routing (Phase 6). No test reaches the real Jev (the no_jev fixture).
+# ---------------------------------------------------------------------------
+
+TYPO_FILE = _file("src/flask/debughelpers.py", ["# fix typo"], ["# fix tpyo"])
+TYPO_PR = _pr(TYPO_FILE)  # the uncertain middle: 1 code file, 2 changed lines
+LOCK_FILE = {"path": "uv.lock", "status": "modified", "diff": "@@ -1 +1 @@\n-a\n+b\n", "lines_added": 1, "lines_removed": 1}
+JEV_KEY = {"JEV_API_KEY": "test-key"}
+_TIMEOUT, _CONNECT = "timeout", "connect"  # scripted exceptions for the mock transport
+
+
+def _noul(value: object, **fields: object) -> httpx.Response:
+    """A Jev answer as the real API sends it (Phase 6.1); `fields` replace top-level keys."""
+    body = {"model": "jev-1.14.0", "answers": {"light_review_enough": {"type": "noul", "noul": value}},
+            "usage": {"input_tokens": 615, "output_tokens": 23}}
+    return httpx.Response(200, json=body | fields)
+
+
+def _mock_jev(monkeypatch: pytest.MonkeyPatch, script: list) -> list[httpx.Request]:
+    """Serve `script` (responses, or _TIMEOUT / _CONNECT) one request at a time, and return
+    the requests seen. A request beyond the script fails the test (IndexError)."""
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        step = script[len(requests) - 1]
+        if step == _TIMEOUT:
+            raise httpx.ReadTimeout("timed out", request=request)
+        if step == _CONNECT:
+            raise httpx.ConnectError("refused", request=request)
+        return step
+
+    monkeypatch.setattr(router, "_jev_transport", lambda: httpx.MockTransport(handler))
+    return requests
+
+
+def _jev_request(pr: PRInput) -> tuple[dict | None, str | None]:
+    """`jev_request` for an uncertain-middle PR (checked: no hard rule decides it)."""
+    result = preprocess(pr, CORE_PATTERNS)
+    assert apply_hard_rules(result.classifications, result.stats) is None
+    return jev_request(result.pr, result.classifications)
+
+
+def test_jev_request() -> None:
+    """Phase 6.4: the bounded, deterministic Jev payload (no network)."""
+    body, why_not = _jev_request(TYPO_PR)
+    assert body is not None and why_not is None
+    assert body["model"] == "jev-1.14.0"
+    assert body["questions"] == {
+        "light_review_enough": {"type": "noul", "instructions": JEV_INSTRUCTIONS, "criteria": JEV_CRITERIA}
+    }
+    state = body["state"]
+    assert state["title"] == "t" and state["description"] == "d"
+    assert state["files"] == [
+        {"path": "src/flask/debughelpers.py", "status": "modified", "category": "source", "lines_added": 1, "lines_removed": 1}
+    ]
+    assert "files_not_listed" not in state
+    assert state["diffs"] == [{"path": "src/flask/debughelpers.py", "hunks": "@@ -1,1 +1,1 @@\n-# fix tpyo\n+# fix typo\n"}]
+    assert list(state) == ["title", "description", "files", "diffs"]  # the key order checked in 6.1
+    assert _jev_request(TYPO_PR) == (body, None)  # deterministic
+    json.dumps(body)  # JSON-serializable as is
+
+    # The title and description are cut with a marker; PR text stays in `state`, never in the question.
+    long = _jev_request(TYPO_PR.model_copy(update={"pr_title": "y" * 1000, "pr_description": "x" * 3000}))[0]["state"]
+    assert long["title"] == "y" * 300 + "… [700 more characters]"
+    assert long["description"] == "x" * 1500 + "… [1500 more characters]"
+
+    # 25 docs + 1 source + 1 lockfile: 20 listed, code first; docs and mechanical files send no diff text.
+    state = _jev_request(_pr(*[_file(f"docs/page{i:02}.md", ["text"]) for i in range(25)], TYPO_FILE, LOCK_FILE))[0]["state"]
+    assert len(state["files"]) == 20 and state["files_not_listed"] == 7
+    assert state["files"][0]["path"] == "src/flask/debughelpers.py"
+    assert [d["path"] for d in state["diffs"]] == ["src/flask/debughelpers.py"]
+    assert list(state) == ["title", "description", "files", "files_not_listed", "diffs"]
+    small = _jev_request(_pr(LOCK_FILE, TYPO_FILE))[0]["state"]
+    assert [f["path"] for f in small["files"]] == ["src/flask/debughelpers.py", "uv.lock"]  # mechanical last
+
+    # Jev isn't asked, with the reason: code diffs over JEV_DIFF_MAX_CHARS (D6), or a secret
+    # in a line that would be sent but that scan_pr doesn't check: removed or context (CR1).
+    assert _jev_request(_pr(_file("src/flask/debughelpers.py", ["x" * 9000]))) == (None, "code diffs exceed 8000 characters")
+    secret = f'SECRET_KEY = "{FAKE_SECRET}"'
+    removed = _pr(_file("src/flask/cli.py", ["x = 1"], [secret]))
+    context = _pr({"path": "src/flask/cli.py", "status": "modified", "lines_added": 1, "lines_removed": 1,
+                   "diff": f"@@ -1,2 +1,2 @@\n {secret}\n-x = 1\n+x = 2\n"})
+    for pr in (removed, context):
+        assert _jev_request(pr) == (None, "possible secret in the diff's removed or context lines")
+
+    # hunks_text: file headers and lines outside a hunk are left out; a hunkless diff gives "".
+    headed = "diff --git a/f.py b/f.py\nindex 1..2 100644\n--- a/f.py\n+++ b/f.py\n@@ -1 +1 @@ def f():\n-a\n+b\n"
+    assert hunks_text(headed) == "@@ -1 +1 @@ def f():\n-a\n+b\n"
+    assert hunks_text("not a diff") == ""
+
+
+@pytest.mark.parametrize(
+    ("script", "p_simple", "problem", "warning"),
+    [
+        ([_noul(0.93)], 0.93, None, None),
+        ([_noul(1)], 1.0, None, None),  # a JSON integer is a valid probability
+        ([httpx.Response(200, json={"model": "jev-1.14.0", "answers": {  # our question is read by name
+            "other": {"type": "noul", "noul": 0.99}, "light_review_enough": {"type": "noul", "noul": 0.42}}})],
+         0.42, None, None),
+        ([_noul(0.93, usage={"input_tokens": 600})], 0.93, None, None),  # usage is best-effort (CR5)
+        ([_noul(0.93, usage=None)], 0.93, None, None),
+        ([_noul(0.93, usage={"output_tokens": 23})], 0.93, None, None),  # no input count: cost line says so
+        ([_TIMEOUT, _TIMEOUT], None, "timeout after 2 attempts", None),
+        ([_TIMEOUT, _noul(0.93)], 0.93, None, None),
+        ([_TIMEOUT, httpx.Response(503)], None, "timeout, then HTTP 503 after 2 attempts", None),  # CR7
+        ([_CONNECT, _CONNECT], None, "connection error after 2 attempts", None),
+        ([httpx.Response(503), httpx.Response(503)], None, "HTTP 503 after 2 attempts", None),
+        ([httpx.Response(529), _noul(0.42)], 0.42, None, None),
+        ([httpx.Response(401, json={"detail": "ECHO-PR-TEXT"})], None, "HTTP 401",
+         "Warning: Jev rejected the request (HTTP 401); routed complex without retrying."),
+        ([httpx.Response(429)], None, "HTTP 429", "Warning: Jev rejected the request (HTTP 429)"),
+        ([httpx.Response(200, json={"model": "jev-1.14.0", "answers": {}})], None, "unexpected response",
+         "(answers.light_review_enough: missing)"),
+        ([_noul(1.7)], None, "unexpected response", "(answers.light_review_enough.noul: less_than_equal)"),
+        ([_noul(True)], None, "unexpected response", "(answers.light_review_enough.noul: float_type)"),
+        ([_noul("0.9")], None, "unexpected response", "(answers.light_review_enough.noul: float_type)"),
+        ([httpx.Response(200, content=b"ECHO-PR-TEXT not json")], None, "unexpected response", "(body: json_invalid)"),
+        ([_noul(0.93, model="jev-2.0.0")], None, "unexpected model",  # CR6: not the pinned model
+         "Warning: Jev answered with model 'jev-2.0.0', not the pinned jev-1.14.0; routed complex without retrying."),
+        ([_noul(0.93, model="m" * 200)], None, "unexpected model", "… [140 more characters]'"),  # bounded
+    ],
+)
+def test_ask_jev(monkeypatch: pytest.MonkeyPatch, script: list, p_simple: float | None, problem: str | None,
+                 warning: str | None) -> None:
+    """Phase 6.5: Jev's HTTP outcomes over a mock transport, through the real client settings."""
+    requests = _mock_jev(monkeypatch, script)
+    body, _ = _jev_request(TYPO_PR)
+    with router._jev_client("test-key") as client:
+        assert client.timeout == httpx.Timeout(3.0)
+        answer = router.ask_jev(body, client)
+
+    assert (answer.p_simple, answer.problem) == (p_simple, problem)
+    if warning is None:
+        assert answer.warning is None
+    else:
+        assert answer.warning is not None and warning in answer.warning
+    assert answer.attempts == len(requests) == len(script)  # retried exactly as scripted; never a third attempt
+    if p_simple is not None:
+        usage = json.loads(script[-1].content).get("usage") or {}
+        assert (answer.model, answer.input_tokens) == ("jev-1.14.0", usage.get("input_tokens"))
+    for text in (answer.problem or "", answer.warning or ""):  # no key, no echoed response body
+        assert "test-key" not in text and "ECHO-PR-TEXT" not in text
+    sent = requests[0]
+    assert (sent.method, str(sent.url)) == ("POST", "https://api.typesafe.ai/v1/systemone")
+    assert sent.headers["Authorization"] == "Bearer test-key"
+    assert json.loads(sent.content) == body
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [(None, 0.85), ("", 0.85), ("0.9", 0.9), ("1.0", 1.0), ("0.5", 0.5),
+     ("abc", None), ("0.3", None), ("1.5", None), ("nan", None), ("inf", None)],
+)
+def test_jev_threshold(monkeypatch: pytest.MonkeyPatch, value: str | None, expected: float | None) -> None:
+    """Phase 6.6 (D5): the JEV_THRESHOLD override is read at call time and must lie in [0.5, 1.0]."""
+    if value is not None:
+        monkeypatch.setenv("JEV_THRESHOLD", value)
+    if expected is None:
+        with pytest.raises(ValueError, match=r"JEV_THRESHOLD must be a number in \[0\.5, 1\.0\]"):
+            router.jev_threshold()
+    else:
+        assert router.jev_threshold() == expected
+
+
+JEV_LINE = re.compile(r"^Jev: jev-1\.14\.0, 1 attempt, \d+\.\d\d s, 615 input tokens \(~\$0\.00003\)\.$")
+_MIDDLE = "Route: complex (fallback: uncertain middle; "
+
+
+@pytest.mark.parametrize(
+    ("pr", "env", "script", "route", "source", "p", "line", "notes"),
+    [
+        pytest.param(TYPO_PR, {}, [], "complex", "fallback", None,
+                     _MIDDLE + "Jev unavailable: no JEV_API_KEY).", [], id="no key: Jev never called"),
+        pytest.param(TYPO_PR, JEV_KEY, [_noul(0.93)], "simple", "jev", 0.93,
+                     "Route: simple (Jev, p=0.93): threshold 0.85; 1 code file, 2 changed code lines.", [JEV_LINE],
+                     id="Jev above the threshold: simple"),
+        pytest.param(TYPO_PR, JEV_KEY, [_noul(0.85)], "simple", "jev", 0.85,
+                     "Route: simple (Jev, p=0.85): threshold 0.85; 1 code file, 2 changed code lines.", [JEV_LINE],
+                     id="Jev at the threshold: simple (inclusive)"),
+        pytest.param(_pr(_file("src/flask/cli.py", ["x = 1"])), JEV_KEY, [_noul(0.84)], "complex", "jev", 0.84,
+                     "Route: complex (Jev, p=0.84): threshold 0.85; 1 code file, 1 changed code line.", [JEV_LINE],
+                     id="Jev below the threshold: complex"),
+        pytest.param(TYPO_PR, JEV_KEY | {"JEV_THRESHOLD": "0.95"}, [_noul(0.93)], "complex", "jev", 0.93,
+                     "Route: complex (Jev, p=0.93): threshold 0.95; 1 code file, 2 changed code lines.", [JEV_LINE],
+                     id="JEV_THRESHOLD override"),
+        pytest.param(TYPO_PR, JEV_KEY | {"JEV_THRESHOLD": "0.3"}, [], "complex", "fallback", None,
+                     _MIDDLE + "Jev not asked: invalid JEV_THRESHOLD).",
+                     [re.compile(r"^Warning: JEV_THRESHOLD must be a number in \[0\.5, 1\.0\], got '0\.3'; routed complex\.$")],
+                     id="invalid JEV_THRESHOLD: fallback with a warning, no crash (CR2)"),
+        pytest.param(TYPO_PR, JEV_KEY, [_TIMEOUT, _TIMEOUT], "complex", "fallback", None,
+                     _MIDDLE + "Jev unavailable: timeout after 2 attempts).",
+                     [re.compile(r"^Jev: 2 attempts, \d+\.\d\d s, no usable answer\.$")],
+                     id="timeout twice: fallback"),
+        pytest.param(TYPO_PR, JEV_KEY, [httpx.Response(401)], "complex", "fallback", None,
+                     _MIDDLE + "Jev unavailable: HTTP 401).",
+                     [re.compile(r"^Jev: 1 attempt, .* no usable answer\.$"),
+                      re.compile(r"^Warning: Jev rejected the request \(HTTP 401\); routed complex without retrying\.$")],
+                     id="401: fallback with a warning"),
+        pytest.param(TYPO_PR, {"JEV_API_KEY": "test-key”"}, [], "complex", "fallback", None,
+                     _MIDDLE + "Jev unavailable: client setup failed).",
+                     [re.compile(r"^Warning: the Jev client couldn't be created \(UnicodeEncodeError\); "
+                                 r"check JEV_API_KEY and the proxy settings; routed complex\.$")],
+                     id="non-ASCII key: fallback with a warning, no crash (CR3)"),
+        pytest.param(_pr(_file("src/flask/debughelpers.py", ["x" * 9000])), JEV_KEY, [], "complex", "fallback", None,
+                     _MIDDLE + "Jev not asked: code diffs exceed 8000 characters).", [],
+                     id="payload over its limit: Jev not asked"),
+        pytest.param(_pr(_file("src/flask/cli.py", ["x = 1"], [f'SECRET_KEY = "{FAKE_SECRET}"'])), JEV_KEY, [],
+                     "complex", "fallback", None,
+                     _MIDDLE + "Jev not asked: possible secret in the diff's removed or context lines).", [],
+                     id="secret in a removed line: Jev not asked, nothing sent (CR1)"),
+        pytest.param(_sample(), JEV_KEY, [], "complex", "rule", None, None, [], id="sample: rules decide"),
+        pytest.param(_pr(_file("README.md", ["fix"], ["fxi"])), JEV_KEY, [], "simple", "rule", None, None, [],
+                     id="docs only: rules decide"),
+        pytest.param(_pr(_file("README.md", [f'SECRET_KEY = "{FAKE_SECRET}"'])), JEV_KEY, [], "complex", "rule",
+                     None, None, [], id="secret in a docs file: rules decide, nothing sent"),
+    ],
+)
+def test_jev_routing(monkeypatch: pytest.MonkeyPatch, pr: PRInput, env: dict[str, str], script: list,
+                     route: str, source: str, p: float | None, line: str | None, notes: list) -> None:
+    """Phase 6.6: the routing decision with the Jev layer. An empty script keeps the
+    autouse guard, so any request fails the test: Jev must not be called there."""
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    requests = _mock_jev(monkeypatch, script) if script else []
+
+    result = preprocess(pr, CORE_PATTERNS)
+    decision, got_notes = decide_route(result.pr, result.classifications, result.stats)
+
+    assert (decision.route, decision.source, decision.probability) == (route, source, p)
+    assert len(requests) == len(script)
+    if line is not None:
+        assert router.describe_route(decision) == line
+    assert len(got_notes) == len(notes) and all(pattern.match(n) for pattern, n in zip(notes, got_notes))
+    texts = [router.describe_route(decision), *got_notes]
+    assert not any(secret in text for secret in (env.get("JEV_API_KEY", "test-key"), FAKE_SECRET) for text in texts)
+
+
+@pytest.mark.parametrize("error", [httpx.InvalidURL("bad proxy URL"), ValueError("bad proxy")])
+def test_jev_client_setup_error(monkeypatch: pytest.MonkeyPatch, error: Exception) -> None:
+    """Phase 6.10 (CR3): an error while building the client routes complex with a warning.
+    Real httpx raises InvalidURL there for a malformed HTTPS_PROXY (checked in 6.10), but only
+    with its default transport, which a test must not use; so the transport hook raises."""
+    monkeypatch.setenv("JEV_API_KEY", "test-key")
+
+    def broken() -> httpx.BaseTransport:
+        raise error
+
+    monkeypatch.setattr(router, "_jev_transport", broken)
+    result = preprocess(TYPO_PR, CORE_PATTERNS)
+    decision, notes = decide_route(result.pr, result.classifications, result.stats)
+    assert router.describe_route(decision) == _MIDDLE + "Jev unavailable: client setup failed)."
+    assert notes == [f"Warning: the Jev client couldn't be created ({type(error).__name__}); "
+                     "check JEV_API_KEY and the proxy settings; routed complex."]
+
+
+@pytest.mark.parametrize(
+    ("key", "noul", "route_line", "analysts_ran"),
+    [
+        pytest.param(True, 0.93, ": Route: simple (Jev, p=0.93): threshold 0.85; 1 code file, 2 changed code lines.",
+                     False, id="Jev says simple: simple path"),
+        pytest.param(True, 0.42, ": Route: complex (Jev, p=0.42): threshold 0.85; 1 code file, 2 changed code lines.",
+                     True, id="Jev says complex: complex path"),
+        pytest.param(False, None, ": Route: complex (fallback: uncertain middle; Jev unavailable: no JEV_API_KEY).",
+                     True, id="no key: complex path, Jev never called"),
+    ],
+)
+def test_graph_jev_paths(monkeypatch: pytest.MonkeyPatch, llm_calls: list[LLMCall], key: bool, noul: float | None,
+                         route_line: str, analysts_ran: bool) -> None:
+    """Phase 6.8: the uncertain-middle typo PR through the whole graph, on a mock Jev."""
+    requests: list[httpx.Request] = []
+    if key:
+        monkeypatch.setenv("JEV_API_KEY", "test-key")
+        requests = _mock_jev(monkeypatch, [_noul(noul)])  # a second request would fail the test
+
+    updates = list(build_graph().stream({"raw_pr": TYPO_PR.model_dump()}, stream_mode="updates"))
+    ran = [node for update in updates for node in update]
+    output = updates[-1]["finalize"]["output"]
+
+    assert len(requests) == int(key)
+    assert ran.count("architecture_analyst") == ran.count("risk_agent") == int(analysts_ran)
+    assert isinstance(output, ReviewOutput)
+    trace = output.reasoning_trace
+    assert all(line.startswith(f"Step {i}: ") for i, line in enumerate(trace, start=1))
+    assert sum(route_line in line for line in trace) == 1
+    assert sum(": Jev: jev-1.14.0, 1 attempt, " in line for line in trace) == int(key)
+    assert not any("test-key" in line for line in trace)
+    synth = [c for c in llm_calls if c.schema is ReviewDraft]
+    expected_effort = config.EFFORT_SYNTH_COMPLEX if analysts_ran else config.EFFORT_SYNTH_SIMPLE
+    assert [c.effort for c in synth] == [expected_effort]
+    assert all(("<pr_diff" in c.user) == (not analysts_ran) for c in synth)  # simple path: synthesize sees the diff

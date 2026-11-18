@@ -183,6 +183,20 @@ def hunk_headers(diff: str) -> list[tuple[int, str]]:
     return [(n, line) for n, line in enumerate(_split_lines(diff), start=1) if _HUNK_HEADER.match(line)]
 
 
+def hunks_text(diff: str) -> str:
+    """The diff's hunks as text: each `@@` header followed by its lines, with file headers
+    and anything outside a hunk left out (the same split as `_hunks`, which makes one hunk
+    per `@@` header). "" when the diff has no hunk. Used for the Jev payload."""
+    hunks = _hunks(diff)
+    if hunks is None:
+        return ""
+    headers = [header for _, header in hunk_headers(diff)]
+    lines: list[str] = []
+    for header, body in zip(headers, hunks, strict=True):
+        lines += [header, *body]
+    return "\n".join(lines)
+
+
 def _change_blocks(hunk: list[str]) -> list[tuple[list[str], list[str]]]:
     """Split a hunk into change blocks: runs of removed/added lines between context lines.
 
@@ -570,6 +584,15 @@ def scan_pr(pr: PRInput) -> list[ScanHit]:
     return hits
 
 
+def secret_in_diff(diff: str) -> bool:
+    """Whether any secret rule matches any line of the diff's hunks: added, removed and
+    context lines (without their marker) and the `@@` headers. `scan_pr` checks added lines
+    only, since deleting a secret is a fix; this wider check guards text that leaves the
+    machine (the Jev payload sends whole hunks, Phase 6.10 CR1)."""
+    lines = diff_body_lines(diff) + [header for _, header in hunk_headers(diff)]
+    return any(rule.search(line) for rule in _SECRET_RULES.values() for line in lines)
+
+
 # ---------------------------------------------------------------------------
 # PR level: stats and the review plan
 # ---------------------------------------------------------------------------
@@ -584,7 +607,16 @@ def clamp(value: float, low: float, high: float) -> float:
     return max(low, min(value, high))
 
 
-def _is_code_file(classification: FileClassification) -> bool:
+def cut_text(text: str, limit: int) -> str:
+    """`text`, or its first `limit` characters and how many more were cut. The one cut
+    marker for bounded output (the agent's tools, the Jev payload)."""
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit]}… [{len(text) - limit} more characters]"
+
+
+def is_code_file(classification: FileClassification) -> bool:
+    """A non-filtered source, config or test file: what `code_files` and `code_lines_changed` count."""
     return (
         classification.filter_reason is None and classification.category in _CODE_CATEGORIES
     )
@@ -602,12 +634,12 @@ def compute_stats(
     text_chars = len(pr.pr_title) + len(pr.pr_description) + kept_diff_chars
     return PRStats(
         files_total=len(files),
-        code_files=sum(_is_code_file(c) for c in files),
+        code_files=sum(is_code_file(c) for c in files),
         source_files=sum(c.filter_reason is None and c.category == "source" for c in files),
         filtered_files=sum(c.filter_reason is not None for c in files),
         lines_added=sum(c.lines_added for c in files),
         lines_removed=sum(c.lines_removed for c in files),
-        code_lines_changed=sum(c.lines_added + c.lines_removed for c in files if _is_code_file(c)),
+        code_lines_changed=sum(c.lines_added + c.lines_removed for c in files if is_code_file(c)),
         estimated_tokens=math.ceil(text_chars / config.CHARS_PER_TOKEN),
         scan_hits=list(scan_hits),
     )
@@ -619,6 +651,13 @@ def ranked_paths(classifications: Mapping[str, FileClassification]) -> list[str]
     The single definition, used by the review plan (`ranked_files`) and the agent's tools.
     """
     return [c.path for c in sorted(kept_files(classifications), key=lambda c: (-c.priority, c.path))]
+
+
+def review_order(classifications: Mapping[str, FileClassification]) -> list[FileClassification]:
+    """Every file: the non-filtered ones in review order (`ranked_paths`), then the
+    mechanical ones in input order. Used by the agent's file list and the Jev payload."""
+    ranked = [classifications[path] for path in ranked_paths(classifications)]
+    return ranked + [c for c in classifications.values() if c.filter_reason is not None]
 
 
 def build_review_plan(

@@ -39,7 +39,7 @@ from langgraph.types import Command
 from pydantic import BaseModel, Field
 
 from . import config, prompts
-from .preprocessing import changed_files_by_path, hunk_headers, normalize_path, ranked_paths
+from .preprocessing import changed_files_by_path, cut_text, hunk_headers, normalize_path, review_order
 from .schemas import ChangedFile, FileClassification, PRInput
 
 
@@ -76,12 +76,6 @@ class DiffPage(NamedTuple):
 # ---------------------------------------------------------------------------
 
 
-def _review_order(ctx: RiskAgentContext) -> list[FileClassification]:
-    """Non-filtered files in review order (as `ranked_files`), then the mechanical ones."""
-    ranked = [ctx.classifications[path] for path in ranked_paths(ctx.classifications)]
-    return ranked + [c for c in ctx.classifications.values() if c.filter_reason is not None]
-
-
 def _changed_file(ctx: RiskAgentContext, path: str) -> ChangedFile:
     """The changed file `path` names (the shared path rule), any file in the PR."""
     files = changed_files_by_path(ctx.pr)
@@ -103,13 +97,6 @@ def _diff_lines(diff: str) -> list[str]:
     numbers match hunk_headers). Unlike it, a final newline doesn't add an empty last line,
     and an empty diff has no lines."""
     return diff.removesuffix("\n").split("\n") if diff else []
-
-
-def _cut(text: str, limit: int) -> str:
-    """`text`, or its first `limit` characters and how many more were cut."""
-    if len(text) <= limit:
-        return text
-    return f"{text[:limit]}… [{len(text) - limit} more characters]"
 
 
 def _bounded(text: str) -> str:
@@ -153,7 +140,7 @@ class _Paging(NamedTuple):
 def _header_list(paging: _Paging, page_of: Callable[[int], int]) -> str:
     """Page 1's list of hunk headers, with each one's diff line and page (§3.5)."""
     shown = paging.headers[: config.TOOL_MAX_HUNK_HEADERS]
-    listed = [f"line {n} (page {page_of(n)}): {_cut(h, config.TOOL_HUNK_HEADER_MAX_CHARS)}" for n, h in shown]
+    listed = [f"line {n} (page {page_of(n)}): {cut_text(h, config.TOOL_HUNK_HEADER_MAX_CHARS)}" for n, h in shown]
     if len(paging.headers) > len(shown):
         listed.append(f"+{len(paging.headers) - len(shown)} more")
     return "; ".join(listed) if listed else "none"
@@ -164,7 +151,7 @@ def _paging(diff: str) -> _Paging:
     before its shown text would pass TOOL_PAGE_MAX_CHARS; page 1 also holds the header list,
     so its room is smaller by that list's longest possible length. A page always holds at
     least one line, so every line is on some page."""
-    lines = [_cut(line, config.TOOL_LINE_MAX_CHARS) for line in _diff_lines(diff)]
+    lines = [cut_text(line, config.TOOL_LINE_MAX_CHARS) for line in _diff_lines(diff)]
     paging = _Paging(lines, [0], hunk_headers(diff))
     # Page numbers aren't known yet: measure the header list with the widest one possible.
     widest = int("9" * len(str(max(1, len(lines)))))
@@ -185,7 +172,7 @@ def list_changed_files(ctx: RiskAgentContext) -> str:
     """One line per changed file: path, status, category, +/-, priority, and the filter
     reason for mechanical files (§7)."""
     lines = []
-    for c in _review_order(ctx):
+    for c in review_order(ctx.classifications):
         mechanical = f", mechanical: {c.filter_reason}" if c.filter_reason is not None else ""
         lines.append(
             f"- {c.path} ({c.status}, {c.category}, +{c.lines_added}/-{c.lines_removed}, "
@@ -277,7 +264,7 @@ def search_diff(ctx: RiskAgentContext, pattern: str) -> str:
     files = changed_files_by_path(ctx.pr)
     hits: list[str] = []
     total = 0
-    for c in _review_order(ctx):
+    for c in review_order(ctx.classifications):
         diff = files[normalize_path(c.path)].diff
         paging: _Paging | None = None  # only built for a file with a hit
         for n, line in enumerate(_diff_lines(diff), start=1):
@@ -292,7 +279,7 @@ def search_diff(ctx: RiskAgentContext, pattern: str) -> str:
                 total += 1
                 if len(hits) < config.SEARCH_DIFF_MAX_HITS:
                     paging = paging or _paging(diff)
-                    hits.append(f"{c.path}:{n} (page {paging.page_of(n)}): {_cut(line, config.SEARCH_HIT_MAX_CHARS)}")
+                    hits.append(f"{c.path}:{n} (page {paging.page_of(n)}): {cut_text(line, config.SEARCH_HIT_MAX_CHARS)}")
     if not hits:
         return "no matches"
     if total > len(hits):
