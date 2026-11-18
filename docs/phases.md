@@ -15,7 +15,7 @@ A phase is broken into sub-tasks before we start it, and the sub-tasks are revie
 | 2 | Deterministic layer | Preprocessing, routing rules and scoring give correct results on the sample and synthetic PRs | ✅ Done |
 | 3 | Graph skeleton | The graph compiles, prints Mermaid, and both paths run on stubs | ✅ Done |
 | 4 | LLM foundation | First real run on the sample | ✅ Done |
-| 5 | ReAct risk agent (`create_agent`) | The agent loop works, stops on budget, and recovers from tool errors | — |
+| 5 | ReAct risk agent (`create_agent`) | The agent loop works, stops on budget, and recovers from tool errors | ✅ Done |
 | 6 | Jev router | The uncertain middle is routed with and without `JEV_API_KEY` | — |
 | 7 | Degradation & CLI | Simulated failures produce degraded output with exit code 3 | — |
 | 8 | Langfuse tracing (dev only) | A nested trace appears in the Langfuse UI | ✅ Done (early, before Phase 4) |
@@ -698,7 +698,8 @@ Both ran on the whole Phase 3 diff. Validated findings applied; the rest were le
 - degradation on LLM failure, the CLI and exit codes (Phase 7).
 
 ## Phase 5: ReAct risk agent (`create_agent`)
-**Files:** `tools.py` (`@tool` functions, `ToolInputError`, the `on_error` handler), `project_context.md`, `risk_agent.py` (`RiskAgentState`, `RiskAgentContext`, the middleware, budgets, wrapper, recovery call, hallucination guards, coverage check).
+**Files:** `tools.py` (new), `risk_agent.py` (new), `config.py`, `llm.py`, `prompts.py`, `nodes.py`, `observability.py` (F2), `tests/test_pipeline.py`, `docs/PLAN.md` (approved decisions only).
+`project_context.md` doesn't change: its convention sections were written in 2.3, and Phase 5 only reads them.
 **Check:**
 - the agent prints its own Mermaid,
 - the tool calls make sense on the sample,
@@ -707,7 +708,617 @@ Both ran on the whole Phase 3 diff. Validated findings applied; the rest were le
 - a tiny model-call limit triggers the recovery call,
 - a bad path or regex comes back as a recoverable error,
 - `files_inspected` is filled.
-*Sub-tasks: to be written when the phase starts.*
+
+**Goal:** the `risk_agent` stub becomes the real ReAct agent from PLAN.md §7: `create_agent` with 4 read-only tools, explicit middleware, budgets from the review plan, a recovery call, and deterministic hallucination guards. Each stop condition and error path has a test that runs without an API key.
+**Design references:** PLAN.md §3.2 (tool budget), §3.4 (`must_review`, coverage), §5 (API behaviours 3–6), §6 (the agent's state and context), §7 (all of it), §8 (confidence signals), §9 (LLM failures, untrusted input), §10.7 (usage accounting), §11 (middleware we don't use).
+**Conventions:** these are the same as in Phases 2–4.
+- The tools and guards are pure functions over the PR context, wrapped by thin `@tool`s.
+- Trace lines are plain sentences.
+- `llm.py` stays the only module that imports `langchain_anthropic`.
+- Tests use no API key and no network.
+
+**Checked before writing these sub-tasks** (`langchain` 1.4.9, `langchain-anthropic` 1.7.10, `langgraph` 1.2.19; read from the installed source, with no calls made):
+- `create_agent(model, tools, *, system_prompt, middleware, response_format, state_schema, context_schema, …)`.
+- **`create_agent` sets `recursion_limit=9_999` on the compiled agent** (`factory.py`, LangGraph issue 7313). The §7 backstop therefore works only if the wrapper passes its own `recursion_limit` in the invoke `config`.
+- With `ProviderStrategy`, the model is bound as `model.bind_tools(tools, **strategy.to_model_kwargs(), **model_settings)`. The fake model (5.8) must therefore accept extra keyword arguments in `bind_tools`.
+- `ToolCallLimitMiddleware(run_limit=…, exit_behavior="continue")` sends `"Tool call limit exceeded. Do not make additional tool calls."` back to the model as the blocked call's `ToolMessage`.
+- `ModelCallLimitMiddleware(run_limit=…, exit_behavior="end")`.
+- `ToolErrorMiddleware(on_error)`, where `on_error(exc: Exception, request: ToolCallRequest) -> str | None`. Returning `None` lets the exception propagate. Argument-validation errors never reach it, because `ToolNode` handles them first.
+- `ModelRefusalMiddleware` raises `ModelRefusalError` when a message has a standard `refusal` content block. `langchain-anthropic` emits that block when `stop_reason == "refusal"` (`chat_models.py`). It also catches a refusal that surfaces as a `StructuredOutputValidationError`.
+- `AnthropicPromptCachingMiddleware(type="ephemeral", ttl="5m", min_messages_to_cache=0, unsupported_model_behavior="warn")`.
+
+### Decisions needed before implementing
+Each decision has a recommendation. The sub-tasks below are written as if every recommendation is accepted.
+**Decided (yours, at the start of 5.1):** "take your recommended decisions", so D1–D5 follow the recommendations and D6 is Option B (two sample runs in 5.11). 5.0 is skipped, with the reason given there.
+
+- **D1. The provider boundary for the agent (PLAN §7 vs the 4.3 rule).**
+  - **The conflict:** §7 uses `ChatAnthropic` and `AnthropicPromptCachingMiddleware` inside the agent. Your 4.3 requirement, though, is that only `llm.py` touches the provider.
+  - *Recommended:* `llm.py` gets three small public functions and keeps every provider detail private:
+    - `agent_model(effort) -> BaseChatModel`,
+    - `agent_middleware() -> list[AgentMiddleware]` (the caching middleware),
+    - `usage_of(message: AIMessage) -> Usage`.
+  - `risk_agent.py` imports only `langchain` and `llm`.
+  - *Alternative:* `risk_agent.py` imports `langchain_anthropic` directly. That's simpler, but it breaks the boundary 4.3 set.
+- **D2. Where the PR overview goes in the agent's prompt.**
+  - §7 says the system prompt holds the PR overview. §5.5 and `prompts.py`, though, keep system prompts static, with the PR last.
+  - *Recommended:* a **static** `RISK_AGENT_SYSTEM` (role, risk categories, evidence and data rules), plus a first `HumanMessage` holding the PR overview, `must_review` and the budget. The system prompt and the tool definitions then cache **across runs**, and the history still caches within a run. PLAN.md §7 "System prompt" gets a one-line update to match.
+  - *Alternative:* §7 as written. It caches within a run only.
+- **D3. Usage lines for the agent (§10.7: "one line per LLM call").** An agent with 14 tool calls makes up to 16 model calls.
+  - *Recommended:* one summed line, `LLM risk_agent: 7 calls, 61,230 tokens in (48,900 cached), 9,870 out, ~$0.29 (claude-opus-5-5).`, plus its own line for the recovery call if one runs. Per-call detail stays in Langfuse. §10.7 gets that one sentence added.
+  - *Alternative:* one line per model call, which is 16 trace steps on a big PR.
+- **D4. No `RetryPolicy` on `risk_agent`.** §2 and §9 put `RetryPolicy` on the "LLM nodes", but on this node a retry re-runs the whole agent loop (about $0.30), with the same history.
+  - *Recommended:* the node keeps `retry_policy=None` (`graph.LLM_NODES` is unchanged).
+    - If the final answer fails to parse (`StructuredOutputValidationError`), the wrapper makes **the same recovery call** as on a model-call-limit stop (§7). The recovery call goes through `structured_call`, which raises `LLMSchemaError`, so if it fails too, the node fails. Phase 7 turns that into a degraded node.
+    - A refusal is mapped to `llm.LLMRefusal`.
+    - §9 gets one line: "risk_agent: a bad final answer → the recovery call; no node retry."
+- **D5. What counts as evidence "in the diff" (§7 guards).**
+  - *Recommended:* the evidence is checked against **the finding's own file**, not the whole PR, so a finding can't borrow another file's line.
+  - Both sides are normalised first:
+    - every diff line loses its `+`/`-`/space marker,
+    - the evidence loses a leading `+`/`-` on each line,
+    - whitespace runs collapse to one space.
+  - The evidence must then be a substring of the raw diff **or** of the diff after `prompts._escape`. That second form covers the Phase 4 note: the tools show diffs escaped (5.3), so quoted evidence may contain `&lt;pr_diff`.
+  - Empty evidence is unverified.
+- **D6. Paid calls (your approval).** Estimates use list prices, and the real figures will be recorded.
+  - The 5.1 spike: one agent run on the sample with a tool budget of 3, about $0.10–0.20.
+  - The 5.11 sample runs: the agent at effort `high` plus the two existing calls, about $0.35–0.70 per run. Option A is one run. **Option B (recommended)** is two runs back to back. The second run shows that the cache is read across runs, which is the check carried over from 4.10.
+
+### Sub-tasks
+
+- [x] **5.0 Pre-phase review (your workflow)**: *skipped (your decision: the recommendations)*
+  - Run code-review and code-simplifier on the current code (`7114ba3`), apply the validated findings, and confirm that `uv run pytest -q` still passes.
+  - *Why skipping is recommended:* 4.11 already ran both tools on **all** Phase 4 changes before the merge, and nothing has changed since (the git tree is clean). This is the same reasoning as for 3.0. The review runs again at 5.12, on the Phase 5 diff.
+
+- [x] **5.1 Verify-first spike (offline first, then one paid run under D6)** ✅ *Paid: 1 agent run + 3 recovery-call variants + 1 one-word connectivity call, estimated **≈ $0.21** (the estimate was $0.10–0.20)*
+  - **Results, offline** (3 scratch scripts outside the repo; the real `ChatAnthropic` request was captured just before sending):
+    - **The agent graph:** `ModelCallLimitMiddleware.before_model → model → ModelCallLimitMiddleware.after_model → ToolCallLimitMiddleware.after_model → tools | end`. `ToolErrorMiddleware`, `ModelRefusalMiddleware` and the caching middleware wrap calls and add no nodes. The compiled agent's own config confirms `recursion_limit: 9999`.
+    - **The recursion limit, measured** (the smallest limit that completes):
+      - `k` tool turns and then an answer need `5k + 5` steps,
+      - a run the model-call limit ends after `m` calls needs `5m + 2`. That's the worst case.
+      - So `recursion_limit = 5 × (max_model_calls + 1)`, which is **85 on the sample** (82 needed). That gives a 3-step margin, so no separate slack constant (5.2 updated).
+    - **Tool budget:**
+      - a blocked call gets `ToolMessage(status="error", content="Tool call limit exceeded. Do not make additional tool calls.")`, and the model goes on to answer,
+      - when one turn asks for more calls than are left, the blocked call's `ToolMessage` comes **before** the allowed one's; they're matched by `tool_call_id`,
+      - `files_inspected` holds only the reads that actually ran.
+    - **Model-call limit (`exit_behavior="end"`):** it appends `AIMessage("Model call limits exceeded: run limit (2/2)")`, and `structured_response` is **`None`**. The key is still present, so the check must be on the value, not the key. `files_inspected` repeats a path read twice, so the wrapper deduplicates.
+    - **A final answer that doesn't parse** (bad JSON or the wrong shape) raises `langchain.agents.structured_output.StructuredOutputValidationError`, **out of `invoke`, so the history is lost.** The wrapper therefore runs the agent with `stream(stream_mode="values")` and keeps the last state it saw. The recovery call uses that history (5.5 updated).
+    - **Tool errors:**
+      - `on_error(exc, request: ToolCallRequest)` is called for our exceptions, and a returned string becomes `status="error"`,
+      - an unknown tool gives `"Error: no_such_tool is not a valid tool, try one of [...]"` (from `ToolNode`),
+      - bad arguments give `"Error invoking tool '…' with kwargs {…} with error: page: Input should …"` (from `ToolNode`, before the tool runs),
+      - an internal `KeyError` gives `"Error: KeyError: 'internal'"` (our handler).
+    - **Refusal:** a real-shaped API response with `stop_reason: "refusal"`, passed through `langchain-anthropic`, gets a `refusal` content block, and `ModelRefusalMiddleware` raises `langchain_core.exceptions.ModelRefusalError`.
+    - **The request through the agent** (real `ChatAnthropic`, captured):
+      - `output_config: {effort: "high", format: {type: "json_schema", …}}`, with `verified` absent from the schema,
+      - `thinking: adaptive`, the beta and `fallbacks: "default"`, `max_tokens` 16,000,
+      - **no `tool_choice`, no `temperature`**,
+      - caching: the system prompt and the **last tool definition** carry `cache_control` (5m), plus a top-level `cache_control` for the message tail.
+    - **Thinking blocks** (a real-shaped thinking + `tool_use` response replayed through the real `ChatAnthropic`, `create_agent` and all 5 middleware): the next request sends the thinking block back **unchanged** (same text and signature, before the `tool_use`). The recovery request does too.
+  - **Results, paid** (sample PR, effort `high`, tool budget 3, model calls 5):
+    - **The agent:** 2 model calls in 19 s.
+      - Turn 1: three parallel `read_file_diff` calls (one per file), with no thinking block.
+      - Turn 2: thinking + JSON, `end_turn`.
+      - `structured_response` parsed into 7 findings, and `files_inspected` held all 3 files.
+      - **ProviderStrategy works alongside tools and thinking on the real API (§5.3 verified).**
+    - **Caching within a run:** turn 2 read 1,142 cached tokens (system + tools) and wrote 2,740 (the message tail).
+    - **Finding quality (first look):**
+      - high: `access_route[0]` can be spoofed through X-Forwarded-For,
+      - high: unbounded key growth (memory DoS),
+      - medium: `get_host` used without an import,
+      - low: a lock-free reset, `retry_after` discarded, a "fixed window" docstring on a sliding window, missing tests.
+      - Evidence lines keep their leading indentation, which D5's whitespace normalisation handles.
+    - **The recovery call over the model-call-limit shape** (history + the limit message + the instruction): **(i) with no tools**, `with_structured_output(json_schema)` → OK and parsed (≈ $0.054); (ii) with tools and `tool_choice: none` → OK too (≈ $0.053). *Decision:* use **(i)**, the simpler one: `structured_call_messages` with no tools. (iii) is the parse-failure shape (history + instruction): its output was cut off by my `head`, so it isn't recorded, and I didn't pay to re-run it. It's the same as (i) minus one synthetic assistant message.
+  - **Not verified:**
+    - **The API accepting a real signed thinking block in a tool-use turn:** the model didn't think on its tool turn. Our side (sent unchanged) is verified offline. The API side is checked on the 5.11 runs, where the full budget makes multi-turn likely. *Verified in 5.11: a signed thinking block was sent back over 2 tool turns, with no 400.*
+    - **A recovery call whose history holds thinking blocks**, on the real API. The recovery path is rare, and our side is verified offline.
+  - *Notes:*
+    - The first two paid attempts never reached the API. The cause was a connection error: `load_dotenv()` searched from the scratch script's folder, not the repo. Fixed with an explicit `.env` path.
+    - A one-word call through `llm._claude` (≈ $0.0002) checked the connection.
+  - **Offline:** a scratch script, outside the repo.
+    1. Build the full §7 agent: the 5 middleware, `ProviderStrategy(RiskFindings)`, `state_schema=RiskAgentState`, `context_schema=RiskAgentContext`, and a scripted fake model. Print its Mermaid, and list the node names the middleware adds (`*.before_model`, `*.after_model`).
+    2. **Steps per turn:** on a scripted run of 1 tool turn followed by a final answer, count the LangGraph steps (with `stream(..., stream_mode="debug")`) to get `S`, the steps one model→tools turn takes. This gives the formula for `RISK_RECURSION_LIMIT` (5.2).
+    3. **The request payload, built and not sent:** run the real `ChatAnthropic` behind the agent, capture the request inside a `wrap_model_call` probe, and check it with `_get_request_payload`. It should hold the tool definitions, `output_config.format` (json_schema), effort `high`, adaptive thinking, and the caching middleware's `cache_control` markers, with **no `tool_choice`** and no `temperature`.
+    4. **Stop and error behaviour, recorded exactly:**
+       - the content of a blocked call's `ToolMessage`,
+       - that `exit_behavior="end"` leaves no `structured_response`,
+       - the exception type when the final JSON doesn't parse,
+       - that a raw API response with `stop_reason: "refusal"` becomes a `refusal` block, which raises `ModelRefusalError`.
+    5. **The recovery call's history:** check that the agent's messages plus one closing `HumanMessage` give a valid request. That means no dangling `tool_use` and every thinking block unchanged (§5.6). If they don't, the fallback is to turn the tool results into text in one user message. You approve the choice before 5.5.
+  - **Paid (D6):** one real run on the sample with `max_tool_calls=3`.
+    - It must take at least 2 tool turns and return a parsed `structured_response`, with no 400 (this checks ProviderStrategy together with tools and thinking, §5.3).
+    - Turn 2 or later must show `cache_read_input_tokens > 0` (§5.5).
+    - The thinking blocks must be sent back unchanged (§5.6).
+  - *Done when:* the results are written here, and any assumption that turns out wrong is reported before any code depends on it.
+
+- [x] **5.2 `config.py`: the agent's constants** ✅
+  - *Checks:*
+    - each of the 7 new constants is defined exactly once, and nothing reads them yet (5.3 onwards),
+    - the sample gives `max_tool_calls` 14, `max_model_calls` 16 and `recursion_limit` 85, where the worst case needs 82,
+    - `py_compile` is clean, and `uv run pytest -q` passes (35).
+  - *Result:*
+    - `EFFORT_RISK_AGENT` is in the LLM section, next to the other efforts.
+    - A new "Risk agent (§7)" section holds `MODEL_CALL_SLACK`, `RISK_AGENT_STEPS_PER_TURN` and the four tool bounds, each with a comment on why it has its value.
+    - The module docstring and the old "comes in Phase 5" comment are updated.
+    - No paid calls.
+  - `EFFORT_RISK_AGENT: Final = "high"` (§5).
+  - `MODEL_CALL_SLACK: Final = 2`, so `max_model_calls = max_tool_calls + MODEL_CALL_SLACK` (§7). The comment says why it can't be tighter: one call answers after the last tool result, and one is slack for a turn whose tools were all blocked.
+  - `RISK_AGENT_STEPS_PER_TURN: Final = 5` (measured in 5.1). The limit is `5 × (max_model_calls + 1)`: 85 on the sample, where the worst case (`5m + 2`) needs 82. *Changed by 5.1:* no slack constant, since the `+1` turn already gives a 3-step margin. It should never trigger, and if it does, the node fails (degraded in Phase 7).
+  - `TOOL_DIFF_PAGE_LINES: Final = 400` (§3.5), `SEARCH_DIFF_MAX_HITS: Final = 50` (§7), `TOOL_PATH_SUGGESTIONS: Final = 3` (§7, `difflib`).
+  - `SEARCH_HIT_MAX_CHARS: Final = 200`. **This one is new, but small:** a minified or generated line could make one search result enormous, and AGENTS.md requires bounded tools. Each hit line is cut to 200 characters, with `…`.
+  - *Done when:* each number appears exactly once, and the sample gives `max_tool_calls` 14 and `max_model_calls` 16.
+
+- [x] **5.3 `tools.py`: pure functions, the `@tool` wrappers, and the error handler** ✅
+  - *Result:* the 4 pure tools, their `@tool` wrappers (`RISK_TOOLS`), `ToolInputError` and `on_tool_error`, as specified below, with these differences:
+    - **`RiskAgentContext` lives in `tools.py`** (and `risk_agent.py` re-exports it in 5.5). The `ToolRuntime[RiskAgentContext]` annotations must resolve when the tools are created, and `risk_agent.py` imports `tools.py`, so defining it in `risk_agent.py` would make an import cycle. PLAN.md §13 is updated in 5.10.
+    - **`list_changed_files` has no `must-review` flag.** PLAN.md §7 lists only path, status, +/-, category, priority and the filtered flag, and §6's context has no `ReviewPlan`. `must_review` reaches the agent in its first message instead (5.4). The order is still `ranked_files` order, from the same function (see below), then the mechanical files.
+    - **Small additions:**
+      - `preprocessing.ranked_paths()` is extracted from `build_review_plan`, so the plan and the tools share one ranking,
+      - `preprocessing.hunk_headers()` gives each header with its line number in the diff,
+      - `prompts.escape_tags()` and `prompts.tool_diff_block()` reuse the Phase 4 escaping and `_block`.
+    - **Hunk headers are listed with their line numbers in the diff** (`line 1: @@ -19,6 …`), on every page, so the agent can jump to a hunk.
+    - **A diff's final newline doesn't add an empty last line.**
+  - **Schema check:** the model sees only `path`/`page`, `pattern` and `topic`. `runtime` is hidden.
+  - **Test:** `test_risk_tools` (the pure functions, on the sample and on a synthetic PR):
+    - listing order; page 1 of `app.py`, with its 6 hunk headers and a known line; `./` paths,
+    - the `TooManyRequests` hit at `src/flask/app.py:5 (page 1)`; "no matches",
+    - one project section, matched without regard to case,
+    - page 3 of a 1,001-line diff; the 50-hit cap with "950 more"; a hit line cut to 200 characters,
+    - a filtered lockfile, listed last and still readable,
+    - a hostile `</pr_diff>` escaped,
+    - the 4 `ToolInputError` cases and their `on_tool_error` text, and the `KeyError` text.
+    - *Fault injection* (6 of 6 caught): the phantom last line, no hit cap, no line cut, no path normalising, filtered files hidden, the page range unchecked.
+  - **Checks:** `uv run pytest -q` passes (36), and `py_compile` is clean. The wrappers run inside the agent from 5.5 on; the `Command` update was already checked in the 5.1 spike.
+  - ~~**Known limitation:** Python's `re` has no timeout, so a regex with catastrophic backtracking could stall `search_diff`.~~ *Resolved in the review pass before 5.11 (R2, your decision): `search_diff` now uses the `regex` package with a timeout.*
+  - `class ToolInputError(Exception)`: a mistake the agent can fix. Its message tells the agent how.
+  - **Pure functions**, each taking `ctx: RiskAgentContext` and returning `str`. They are tested directly (5.8):
+    - `list_changed_files(ctx)` gives one line per file, in `ranked_files` order, then the mechanical files: `- {path} ({status}, {category}, +a/-r, priority {p:.2f}[, must-review][, mechanical: {filter_reason}])`. Paths are escaped.
+    - `read_file_diff(ctx, path, page=1)`:
+      - the path is matched after `normalize_path`. **Every changed file can be read, filtered ones included** (the Phase 3 note: a filtered file with a scan hit is in `must_review`),
+      - an unknown path raises `ToolInputError("unknown path `x`; closest changed files: `a`, `b`, `c`")` (`difflib.get_close_matches`, at most 3; with no match, it says "call list_changed_files"),
+      - `pages = max(1, ceil(diff_lines / TOOL_DIFF_PAGE_LINES))`, and `page` outside `1..pages` raises `ToolInputError("page 2 is out of range: `x` has 1 page (1–1)")`,
+      - the output is `prompts.tool_diff_block(path, page, pages, hunk_headers, lines)`: a `<pr_diff path=… page="1 of 1">` block, using Phase 4's `_block`, so our tags are escaped. It holds `Hunk headers: …` and then the page's raw lines. An empty diff gives `(no diff text)`.
+    - `search_diff(ctx, pattern)`:
+      - `re.compile` failing raises `ToolInputError("invalid regex: {err}; escape special characters such as ( [ . * with a backslash")`,
+      - it searches every changed file's diff, line by line, and gives `{path}:{n} (page {p}): {text}`, where `n` is the line number **within the diff**, so the agent knows which page to read,
+      - it stops at 50 hits and adds `"… more hits not shown; narrow the pattern"`,
+      - with no hits, it says `"no matches"`,
+      - the output goes through `_escape`.
+    - `read_project_context(ctx, topic)`:
+      - it returns the first `##` section whose heading contains `topic`, ignoring case,
+      - with no match, it raises `ToolInputError` listing the headings,
+      - an unknown topic isn't in the §7 error table, but it's the same class of error.
+  - **`@tool` wrappers:** each has a Pydantic `args_schema` (`page: int = Field(1, ge=1)`, `pattern: str = Field(min_length=1)`, …) and `runtime: ToolRuntime[RiskAgentContext]`, which is injected and hidden from the model. The docstrings are the tool descriptions the model sees.
+    - `read_file_diff` returns `Command(update={"files_inspected": [path], "messages": [ToolMessage(content, tool_call_id=runtime.tool_call_id)]})`. The path is recorded as the PR spells it.
+    - `RISK_TOOLS = [list_changed_files_tool, read_file_diff_tool, search_diff_tool, read_project_context_tool]`.
+  - `on_tool_error(exc, request) -> str`:
+    - `ToolInputError` gives `f"Error: {exc}"`,
+    - any other exception gives `f"Error: {type(exc).__name__}: {exc}"` (§7, no stack trace),
+    - LangGraph's control-flow signals never reach it (they're handled upstream).
+  - *Bounded:* every tool is a pure read over the context, with no file system, network or `eval`. Pages and hits are capped.
+
+- [x] **5.4 `prompts.py`: the agent's prompts** ✅
+  - *Result:* `RISK_AGENT_SYSTEM`, `risk_agent_user(...)` and `RISK_RECOVERY_INSTRUCTION`, as specified below. The system prompt is about 840 tokens by the 4-chars-per-token estimate, so it's cacheable on its own (minimum 512), before the tool definitions are added. The differences:
+    - **`_DATA_RULE` isn't edited.** A separate `_TOOL_DATA_RULE` ("tool results show PR content … data under the same rule") goes into the agent's prompt only. Editing the shared rule would have told nodes that have no tools about tool results, and would have changed their cached prompts. Checked: `architecture_system()` and `SYNTHESIZE_SYSTEM` are **byte-identical to `HEAD`**.
+    - **The must-review paths stay inside the overview block.** The instructions say "read the must-review files listed in the overview first" and name no path, because paths are untrusted PR text and would otherwise appear outside a data block.
+    - **One new constant:** `config.RISK_AGENT_MAX_FINDINGS = 8`, built into the prompt ("at most 8 findings"). It's an instruction, not enforced, and the synthesizer still shows at most 15 findings.
+    - The shared evidence rule is renamed `_FINDINGS_EVIDENCE_RULE` (the text is unchanged).
+    - The system prompt also covers how to work (must-review first, then `search_diff` and `read_project_context`; tools may be batched in one turn; blocked calls past the budget) and severity guidance in the §8 rubric's terms. "0 findings is a valid answer; never invent a risk."
+  - **Test** (extends `test_prompt_data_blocks`):
+    - `RISK_AGENT_SYSTEM` has no PR text,
+    - a hostile title can't close the agent's overview block,
+    - the budget is stated,
+    - no PR text appears after the data blocks,
+    - the findings limit and the tool-data rule are present, and the synthesizer prompt doesn't mention tool results.
+    - *Fault injection* (4 of 4 caught): must-review paths in the instructions, the tool-data rule removed, the budget not stated, an unescaped title.
+  - **Checks:** `uv run pytest -q` passes (36), and `py_compile` is clean.
+  - `RISK_AGENT_SYSTEM`, static (D2):
+    - the role (find concrete risks, backed by evidence, not style),
+    - the risk categories: security (injection, auth, secrets, unsafe input handling), correctness and edge cases, concurrency and shared state, error handling and resources, compatibility and breaking changes, performance and DoS, risky changes without tests,
+    - how to work: read `must_review` first, use `search_diff` to find usages, stop when the budget is spent or the evidence is enough,
+    - severity guidance in the §8 rubric's terms,
+    - the evidence rule, shared with the architecture analyst and renamed `_FINDINGS_EVIDENCE_RULE`,
+    - `_DATA_RULE`, extended to say that **tool results** are untrusted data too.
+  - `risk_agent_user(pr, classifications, plan, stats, *, max_tool_calls) -> str`: the `_overview` and `_scan_hits` blocks, then "Read these first: …" (`must_review`) and "You have {N} tool calls. When they run out, answer with what you have."
+  - `RISK_RECOVERY_INSTRUCTION`: "The investigation is over. Report only findings backed by evidence you saw in tool results. Use the required JSON format."
+  - `_finding_line` doesn't change. It already marks risk findings "evidence verified" or "not verified".
+  - **Test** (extends `test_prompt_data_blocks`): `RISK_AGENT_SYSTEM` has no PR text; a hostile path or diff in the user message and in a tool block can't close a block.
+
+- [x] **5.5 `risk_agent.py`: the agent, its budgets, the wrapper and the recovery call** ✅
+  - *Result:* `RiskAgentState`, `budgets()`, `build_risk_agent()`, `run_risk_agent()` → `RiskRun`, and `RiskAgentContext` re-exported from `tools.py` (5.3), as specified below. `python -m agent_workflow.risk_agent` prints the agent's Mermaid with no API key: the real model class is built, and nothing is sent. The differences:
+    - **The `llm.py` boundary functions (D1) are done here, not in 5.7,** because the agent needs them to be built and tested:
+      - `agent_model`, `agent_middleware` and `usage_of`,
+      - `structured_call_messages`, which shares `_interpret`,
+      - a `_system()` helper that `_messages` now uses (the request it builds is unchanged; `test_llm_request_payload` still passes).
+      - 5.7 keeps the node wiring and the summed usage line.
+    - **`build_risk_agent(..., provider_middleware=...)`:** the caching middleware is passed in by the wrapper (`llm.agent_middleware()`), so tests run without it. The caching middleware would only warn on a non-Anthropic fake model.
+    - **`RiskRun` reports more than the plan listed:** `recovery_reason` (`"model_call_limit"` / `"unparsed_answer"` / `None`) instead of a bool, `tool_calls` by name, `blocked_calls`, `tool_errors`, the usage of each agent model call, `recovery_usage`, and both budgets, for the 5.7 trace lines.
+    - **Two bugs found by the new test and fixed:**
+      1. **`list_changed_files` always failed** with `TypeError: … missing … 'runtime'`. An explicit empty `args_schema` stops LangChain from injecting `ToolRuntime`. The tool now infers its schema, which the model still sees as `{}` (no arguments).
+      2. **A final answer that doesn't parse wasn't counted in the usage.** It raises before it reaches the state, but it was a billed call. Its message is taken from `StructuredOutputValidationError.ai_message`. It isn't added to the recovery history, which ends with the last tool results, as 5.1 tested.
+    - `read_file_diff`'s `ToolMessage` now carries `name="read_file_diff"`. `ToolNode` names the other tools' results, but not a `Command`'s.
+  - **Tests (no API key; the scripted chat model plays each case through the real `build_risk_agent` and all its middleware):**
+    - `test_risk_agent_loop`, 6 cases:
+
+      | Case | Checked |
+      |---|---|
+      | normal stop | the files read in order; no recovery; 4 model calls = 4 usage entries |
+      | tool budget 2, 3 reads | the 3rd gets "Tool call limit exceeded…"; still answers; exhausted |
+      | the model never stops (budget 2 → 4 model calls) | 2 reads run and 2 are blocked; the run ends; one recovery call whose history ends with the limit message + `RISK_RECOVERY_INSTRUCTION`; `[APP]` deduplicated; exhausted |
+      | 5 tool errors | bad path (closest `src/flask/app.py`), bad regex, page 99, unknown tool, `page="x"`: all are error `ToolMessage`s, and the loop answers |
+      | 2 reads in one turn | both recorded; results matched by `tool_call_id` |
+      | an answer that doesn't parse | recovery over the history ending with a `ToolMessage`; both model calls counted |
+
+      Every case also checks that `recursion_limit` is passed in the run config and that the static system prompt comes first.
+    - `test_risk_agent_budgets_and_refusal`: the sample's `(14, 16, 85)`; a refusal block raises `llm.LLMRefusal`.
+    - *Fault injection* (7 of 8 caught): `exit_behavior="end"` on the tool limit, no `recursion_limit`, no recovery call, no deduplication, `ToolErrorMiddleware` removed, `ModelRefusalMiddleware` removed, the bad answer's usage dropped.
+      - **Not caught:** removing "or the model-call limit ended the run" from `budget_exhausted`. With `MODEL_CALL_SLACK = 2`, a limit stop always means more tool calls were requested than the budget allowed (every non-final turn makes one), so the clause can't change the result today. It's kept, because PLAN §7 states it and it matters if the slack is ever lowered.
+  - **Checks:** `uv run pytest -q` passes (43), `py_compile` is clean, and both Mermaid diagrams print.
+  - **Not yet:** the graph's `risk_agent` node is still the stub. 5.6 adds the guards, and 5.7 wires the node.
+  - The state and context, exactly as in §6:
+    - `class RiskAgentState(AgentState): files_inspected: Annotated[list[str], operator.add]`,
+    - `@dataclass(frozen=True) class RiskAgentContext: pr; classifications; project_context`.
+  - `budgets(plan: ReviewPlan) -> tuple[int, int, int]`, returning `(max_tool_calls, max_model_calls, recursion_limit)`. On the sample: `(14, 16, 85)`.
+  - `build_risk_agent(model: BaseChatModel, *, max_tool_calls: int, max_model_calls: int) -> CompiledStateGraph`, with the middleware in this order:
+    1. `ToolCallLimitMiddleware(run_limit=max_tool_calls, exit_behavior="continue")`,
+    2. `ModelCallLimitMiddleware(run_limit=max_model_calls, exit_behavior="end")`,
+    3. `ToolErrorMiddleware(on_tool_error)`,
+    4. `ModelRefusalMiddleware()`,
+    5. `*llm.agent_middleware()` (the caching middleware, D1).
+    - Then `response_format=ProviderStrategy(RiskFindings)`, `state_schema=RiskAgentState`, `context_schema=RiskAgentContext`, `system_prompt=prompts.RISK_AGENT_SYSTEM`, and `name="risk_agent"`.
+    - The order is fixed by 5.1, and a code comment says why.
+  - `python -m agent_workflow.risk_agent` prints the agent's Mermaid, using the scripted model, so it needs no key.
+  - `run_risk_agent(state: ReviewState, model: BaseChatModel | None = None) -> RiskRun`. `RiskRun` is a frozen dataclass with `findings: RiskFindings`, `files_inspected: list[str]`, `budget_exhausted: bool`, `recovered: bool`, `tool_counts: dict[str, int]`, `blocked_calls: int`, `tool_errors: int`, and `usage: list[llm.Usage]`.
+    1. It builds the agent with `model or llm.agent_model(config.EFFORT_RISK_AGENT)`.
+    2. It runs it with `agent.stream(..., stream_mode="values")` and keeps the last state. The input is `{"messages": [HumanMessage(prompts.risk_agent_user(...))]}`, with `context=RiskAgentContext(...)` and `config={"recursion_limit": recursion_limit}`. *Changed by 5.1:* `stream`, not `invoke`, because a final answer that doesn't parse raises out of `invoke` and loses the history the recovery call needs. Callbacks pass through, so Langfuse nests the agent.
+    3. **Normal stop:** `structured_response` is not `None`.
+    4. **Model-call limit (`structured_response is None`), or `StructuredOutputValidationError` (D4):** it makes the **recovery call**: `llm.structured_call_messages(RiskFindings, effort=config.EFFORT_RISK_AGENT, system=RISK_AGENT_SYSTEM, messages=[...last state's messages, HumanMessage(RISK_RECOVERY_INSTRUCTION)])`.
+       - That's a new public function in `llm.py`, sharing `_interpret` with `structured_call`. It sends **no tools** (variant (i), verified in 5.1).
+       - After a limit stop, the history ends with the middleware's "Model call limits exceeded" message. After a parse failure, it ends with the last tool results.
+    5. A `ModelRefusalError` is raised again as `llm.LLMRefusal`. `GraphRecursionError` and every other error propagate (Phase 7 degrades the node).
+    6. `budget_exhausted = (total tool_calls requested in AIMessages > max_tool_calls) or the run ended without a structured_response`, as in §7.
+    7. `files_inspected` is deduplicated, keeping the order of first reads. A file read over several pages counts once.
+  - The thinking blocks: nothing rewrites messages. 5.1 checks this, and 5.11 checks it again on the real run.
+
+- [x] **5.6 `risk_agent.py`: the hallucination guards (pure, D5)** ✅
+  - *Result:* `evidence_in_diff()` and `apply_guards()`, as specified below.
+    - The trace has at most two lines (dropped findings, unverified findings), naming paths only.
+    - A dropped finding's path is the model's text, shown through `describe_paths` and collapsed to one line by `number_trace` like every trace line. Evidence never appears in the trace.
+  - **Tests:**
+    - `test_hallucination_guards`: the 8 cases in the table below. Every finding is built from model-style input with `"verified": true`, which the schema drops, so the guard alone decides. Each case also checks that no trace line holds the evidence.
+    - `test_hallucination_guards_escaped_and_spans`: evidence quoted escaped (`&lt;pr_diff`) and raw; a span across lines with a marker on each line; a span across a context line; a near miss; empty evidence.
+    - *Fault injection* (8 of 8 caught): the whole PR instead of the file's own diff, no demotion, no whitespace collapse, no escaped variant, evidence markers kept, an unknown file kept, the PR's spelling not applied, empty evidence accepted.
+  - **Checks:** `uv run pytest -q` passes (52), and `py_compile` is clean.
+  - **Known limitations** (by design of D5, noted for the README):
+    - The check is a substring match, so a very short or generic excerpt (e.g. `x = 1`, which also matches `x = 10`) verifies easily. *Narrowed in the review pass before 5.11 (R3): evidence under 12 characters never verifies, and headers don't count. A generic excerpt of 12+ characters can still match.*
+    - An excerpt from a removed line counts, since it's in the diff.
+    - The guard proves the quote exists, not that the finding's reasoning about it is right.
+  - `evidence_in_diff(evidence: str, diff: str) -> bool`, per D5.
+  - `apply_guards(risk: RiskFindings, pr: PRInput) -> tuple[RiskFindings, list[str]]`:
+    - a finding whose file isn't in the PR (after normalising) is **dropped**,
+    - a finding that is kept gets the PR's spelling of the path (as in the Phase 3 review, #5),
+    - evidence found in its file's diff gives `model_copy(update={"verified": True})`,
+    - otherwise `verified` stays `False` and the severity drops one level (high → medium → low, and low stays low),
+    - there's one trace line per kind of change, and paths are named through `describe_paths`. **No trace line holds evidence or pattern text,** which could carry a secret (the Phase 2 rule).
+  - Confidence is already lowered by `unverified_findings` in `confidence_signals` (§8), so there's nothing new in `scoring.py`.
+  - **Expected values on the sample** (`test_hallucination_guards`, parametrized):
+
+    | Finding | Result |
+    |---|---|
+    | `src/flask/app.py`, evidence `from werkzeug.exceptions import TooManyRequests`, high | verified, high |
+    | the same evidence with a `+` prefix and extra spaces | verified |
+    | the same evidence, cited on `src/flask/rate_limiter.py` | unverified, own file only (D5) |
+    | `src/flask/app.py`, evidence `self.limiter.reset_all()` (not in the diff), high | unverified, **medium** |
+    | the same, low | unverified, low |
+    | `./src/flask/app.py`, real evidence | kept as `src/flask/app.py`, verified |
+    | `src/flask/missing.py` | dropped, with a trace line naming it |
+    | empty evidence | unverified |
+    | a diff containing `<pr_diff>`, with evidence quoted escaped (`&lt;pr_diff`) | verified |
+    | an input `"verified": true` from the model | dropped by the schema, then decided by the guard |
+
+    - *Fault injection:* comparing against the whole PR instead of the file's own diff, not demoting, and not normalising whitespace should each make a case fail.
+
+- [x] **5.7 `llm.py` and `nodes.py`: wiring (D1, D3)** ✅
+  - *Result:*
+    - **`nodes.risk_agent` replaces the stub:** `run_risk_agent` → `apply_guards`, then `risk`, `files_inspected`, `risk_budget_exhausted` and the trace lines specified below (tool names and counts only).
+    - **The recovery line** names the limit: `"… stopped by the model-call limit (16); recovery call made."`
+    - **The summed usage line (D3)** is labelled with the call count: `LLM risk_agent (7 calls): …`. The recovery call has its own line, `LLM risk_agent recovery: …`.
+    - **`llm.Usage.__add__`** sums tokens and cost; the model is kept when it's the same for both, otherwise it becomes `"mixed"`.
+    - The other `llm.py` functions were done in 5.5.
+  - **Comments:** the stub wording is removed from `nodes.py`. `graph.py` explains why `risk_agent` has no node retry (D4). `scoring.confidence_signals` now says unverified means "the guards didn't find the evidence".
+  - **Tests:**
+    - **The autouse fixture** now also replaces the agent's model with `MustReviewReader`, which reads every must-review file from the overview in one turn, then answers `{"findings": []}`. The caching middleware is off, and an unexpected recovery call fails the test. **The real agent therefore runs in every graph test**, offline.
+    - **`test_graph_paths`:**
+      - the complex path now says `"Risk reviewer: completed, 0 finding(s)."`,
+      - on the sample, it checks the budget line, `3 tool call(s) (read_file_diff ×3)`, no coverage cap, and **confidence 0.75** (0.80 − 0.05 for the core file; it was capped at 0.50 while the stub read nothing).
+      - R2's "not available." check moved to `test_prompt_data_blocks`, as `risk=None`.
+    - **New `test_risk_agent_node`:**
+      - guarded findings (verified, unverified and demoted, dropped),
+      - the exact first trace lines, two guard lines, the findings summary, and the summed usage line,
+      - no search pattern or evidence text in the trace,
+      - a run the model-call limit stops: the recovery line, `2 blocked`, the recovery usage line, and `risk_budget_exhausted`.
+    - *Fault injection* (6 of 6 caught): the guards skipped, `files_inspected` not mapped, the budget flag not mapped, one usage line per call, the recovery usage not traced, the recovery not traced.
+  - **Checks:** `uv run pytest -q` passes (53), `py_compile` is clean, and the graph's Mermaid prints. No paid calls.
+  - In `llm.py`:
+    - `agent_model(effort) -> BaseChatModel` returns the same private `_claude(effort)`, so the agent gets the same model, `max_tokens`, SDK retries, refusal-fallback beta and `fallbacks`,
+    - `agent_middleware()` returns `[AnthropicPromptCachingMiddleware(ttl="5m")]`,
+    - `usage_of(message)` returns `_usage(message.response_metadata)`,
+    - `Usage.__add__` sums tokens and cost (the model kept when it's the same, else `"mixed"`), for D3's summed line,
+    - `structured_call_messages(...)` (5.5).
+    - The existing `structured_call` doesn't change behaviour; both share `_interpret`.
+  - In `nodes.py`, `risk_agent(state)` replaces the stub. It calls `risk_agent.run_risk_agent(state)`, then `apply_guards`, and returns `risk`, `files_inspected`, `risk_budget_exhausted` and the trace:
+    - `"Risk agent: budget {t} tool calls, {m} model calls."`
+    - `"Risk agent: {n} tool call(s) (list_changed_files ×1, read_file_diff ×3, search_diff ×2); {b} blocked by the budget; {e} tool error(s)."` This gives tool names and counts only, never arguments.
+    - `"Risk agent: read {describe_paths('file', files_inspected)}."` (or `"read no file diffs"`)
+    - `"Risk agent: stopped by the model-call limit; recovery call made."` / `"Risk agent: final answer didn't parse; recovery call made."`, when either happens,
+    - the guard lines, then `"Risk agent: {n} finding(s), {v} verified, max severity {x}."`,
+    - the summed usage line and, if there was one, the recovery call's line (D3).
+  - The node is still looked up on `nodes` (3.7), and the graph wiring doesn't change.
+
+- [x] **5.8 Tests (no API key, no network; all in `tests/test_pipeline.py`)** ✅
+  - *Result:* most of the list below was written along the way, one test per sub-task, as in Phase 4:
+
+    | Planned | Where |
+    |---|---|
+    | `ScriptedChatModel`, the autouse fake agent model | 5.5, 5.7 (`MustReviewReader`) |
+    | `test_risk_tools` | 5.3 |
+    | `test_risk_agent_loop`, the refusal and the budgets | 5.5 (+ `test_risk_agent_budgets_and_refusal`) |
+    | `test_hallucination_guards` | 5.6 |
+    | `test_graph_paths` updated | 5.7 (+ `test_risk_agent_node`) |
+    | The planned fault injections | all 6 were run (5.5, 5.6) |
+
+  - **Gaps found and closed:**
+    1. **A filtered lockfile *with a scan hit*** wasn't tested; the 5.3 lockfile had none. `test_risk_tools` now checks that such a file is in `must_review`, is filtered, and is readable (the Phase 3 note).
+    2. **The real agent request was untested.** The fixture replaces the real agent model, its caching middleware and `structured_call_messages` everywhere, so the 5.1 checks had no regression guard. This is the same gap 4.9 found for `structured_call`.
+       - New `test_risk_agent_request_payload` keeps the real functions (stored before the fixture runs) and replays canned API responses through the real `ChatAnthropic`, `create_agent` and all the middleware. The key is a placeholder, and `_create` is replaced, so nothing is sent.
+       - **Agent request:** effort `high`, JSON schema without `verified`, no `tool_choice` or `temperature`, adaptive thinking, the 4 tools with no `runtime`, the static system prompt cached, the last tool and the message tail cached, and the thinking block sent back unchanged before its `tool_use`.
+       - **Recovery request:** no tools, JSON schema, the cached system prompt, and the thinking block intact.
+       - *Fault injection* (4 of 4 caught): `ToolStrategy`, no caching middleware, the agent's effort ignored, the recovery's system prompt not cached.
+  - **Checks:** `uv run pytest -q` passes (**54**) with `ANTHROPIC_API_KEY` and all Langfuse keys unset. The command sandbox blocks network access, so no test can reach the API. `py_compile` is clean.
+  - **`ScriptedChatModel(BaseChatModel)`:** each call returns the next preset `AIMessage` (tool calls, or a final JSON text answer). `bind_tools(tools, **kwargs)` records the kwargs and returns the model itself. It records every request's messages. After the script runs out it repeats the last tool call, which drives the backstop.
+  - **The autouse fixture:** `llm.agent_model` is patched to a default script that reads every `must_review` file and then answers `{"findings": []}`, so no test can reach the network.
+    - The graph test's complex path then says `"Risk reviewer: completed, 0 finding(s)."` instead of R2's `"not available."`. That assertion is updated, and the R2 case moves to a `risk=None` unit check on `_findings`.
+  - `test_risk_tools`, parametrized over the pure tools, on the sample:
+
+    | Call | Expected |
+    |---|---|
+    | `list_changed_files` | 3 lines, `src/flask/app.py` first (*done in 5.3; no must-review flag, see 5.3*) |
+    | `read_file_diff("src/flask/app.py")` | `page="1 of 1"`, 6 hunk headers, the line `+from werkzeug.exceptions import TooManyRequests` |
+    | `read_file_diff("./src/flask/app.py")` | the same as the previous row |
+    | `read_file_diff("src/flask/ap.py")` | `ToolInputError` naming `src/flask/app.py` |
+    | `read_file_diff("src/flask/app.py", page=2)` | `ToolInputError` "has 1 page" |
+    | a 1,000-line diff, page 3 | `page="3 of 3"`, lines 801–1000 |
+    | `search_diff("TooManyRequests")` | ≥ 1 hit, `src/flask/app.py:5 (page 1): …` |
+    | `search_diff("(")` | `ToolInputError` "invalid regex" |
+    | 60 matching lines | 50 hits + "more hits not shown" |
+    | a hit on a 1,000-character line | cut to 200 characters |
+    | `read_project_context("security")` | the "Security conventions" section |
+    | `read_project_context("nope")` | `ToolInputError` listing the headings |
+    | a filtered lockfile with a scan hit | readable |
+    | a diff holding `</pr_diff>` | escaped in the tool output |
+
+  - `test_risk_agent_loop`, parametrized over scripts on the real `build_risk_agent`:
+
+    | Script | Expected |
+    |---|---|
+    | normal: `list_changed_files`, `read_file_diff` ×2, then the answer | `files_inspected` holds the 2 paths in order; `budget_exhausted` False; not recovered |
+    | **tiny tool budget** (`max_tool_calls=2`, 3 reads asked for) | the 3rd `ToolMessage` is `"Tool call limit exceeded. Do not make additional tool calls."`; the answer still parses; `files_inspected` has 2; `budget_exhausted` True |
+    | **tiny model-call limit** (the model never stops calling tools) | no `structured_response`; the fake `structured_call_messages` is called once, with the history + `RISK_RECOVERY_INSTRUCTION`; `recovered` True; `budget_exhausted` True |
+    | tool errors: a bad path, a bad regex, page 99, an unknown tool name, `page="x"` | 5 error `ToolMessage`s (`status="error"`), with the closest path, the regex hint, the page range, the list of valid tools, and the validation error; the loop goes on to a final answer |
+    | 2 reads in **one** turn (parallel tool calls) | both recorded; each `ToolMessage` matches its `tool_call_id` |
+    | a final answer that doesn't parse | the recovery call is made (D4) |
+    | an `AIMessage` with a `refusal` block | `llm.LLMRefusal` |
+    | `budgets()` on the sample | `(14, 16, 85)`; `recursion_limit` passed in the invoke config (asserted through the fake) |
+
+  - `test_hallucination_guards` (5.6).
+  - `test_graph_paths`: the complex path's `files_inspected` now comes from the agent, so the sample's coverage is 100% and the 0.50 coverage cap is gone. The expected confidence lines are updated: on the sample, 0.80 − 0.05 (core) = 0.75.
+  - *Fault injection, each to be reported:*
+    - `exit_behavior="end"` on the tool limit (the run stops and there's no answer),
+    - no `recursion_limit` in the invoke config,
+    - no recovery call,
+    - `files_inspected` not deduplicated,
+    - the guard using the whole PR,
+    - `ToolErrorMiddleware` removed (the loop crashes on a bad path).
+  - *Done when:* `uv run pytest -q` passes with `ANTHROPIC_API_KEY` and the Langfuse keys unset.
+
+- [x] **5.9 Langfuse F2 (deferred from 4.10, your decision): one generation per call** ✅ *(the code; the trace check is in 5.11)*
+  - **Checked first** (Langfuse 5.2.0 source):
+    - a custom filter **replaces** the default one (`span_processor.py`: `should_export_span or is_default_export_span`),
+    - the default exports Langfuse spans, known LLM instrumentation scopes, and **any span with `gen_ai.*` attributes**. The Anthropic SDK's scope `com.anthropic.sdk.python` isn't on the known list, but its spans carry `gen_ai.*`, which is why every call appeared twice.
+  - *Result:* `observability.should_export_span(span)`: Langfuse's public `langfuse.span_filter.is_default_export_span`, except for that scope and its sub-scopes (`scope + "."`), which are dropped.
+    - `get_langfuse_handler()` first creates the client with `Langfuse(should_export_span=…)`. The `CallbackHandler` and `traced_run`'s `get_client()` reuse that client, configured from the same environment variables.
+    - Checked offline (placeholder keys, an unreachable URL): the client and its span processor carry our filter.
+  - **Test:** `test_langfuse_span_filter`, 6 cases:
+    - the SDK scope and its sub-scope are dropped,
+    - a lookalike scope (`…pythonx`), a known instrumentor, and a `gen_ai` span from elsewhere are kept,
+    - an unrelated span is dropped,
+    - every case outside the SDK scope must equal Langfuse's default.
+    - It's skipped if the dev group isn't installed.
+    - *Fault injection* (3 of 3 caught): the SDK span not dropped, the default rule replaced, the prefix without a boundary.
+  - **Checks:**
+    - `uv run pytest -q` passes (60), including `test_tracing_is_optional`,
+    - `uv run --no-dev`: `observability` imports, and there's no handler (the import stays lazy),
+    - the dev group was reinstalled afterwards and checked.
+  - ~~**Not verified yet:** one generation per Claude call in a real trace. That's checked in the 5.11 runs, with the local Langfuse server up.~~ *Verified in 5.11: 6 and 5 generations for 6 and 5 Claude calls, each nested under its node.*
+  - In `observability.py`, pass a `should_export_span` filter to the Langfuse client that drops scope `com.anthropic.sdk.python`.
+    - *Check first* (Langfuse 5.2.0 source) that a custom filter **replaces** the default one rather than adding to it. If it replaces it, the filter must also call the default, so Langfuse's own spans aren't dropped.
+  - *Done when:* the 5.11 trace shows exactly one generation per Claude call, the agent's turns nested under `risk_agent`, and `test_tracing_is_optional` still passes.
+
+- [x] **5.10 Docs: the plan matches the code (approved decisions only)** ✅
+  - *Result:* PLAN.md now describes what was built and decided, with no new scope:
+    - **§2:** `RetryPolicy` is on the single-call nodes only (D4).
+    - **§5.3:** ProviderStrategy with tools is verified (5.1).
+    - **§5.6:** thinking blocks are verified offline and guarded by a test, with the real-API check still open (5.11).
+    - **§6:** `RiskAgentContext` lives in `tools.py` (5.3); the wrapper streams and keeps the last state (5.1).
+    - **§7:**
+      - the model and caching come from `llm.agent_model`/`agent_middleware` (D1),
+      - a static system prompt, with the PR in the first message (D2),
+      - the recovery call also covers an answer that doesn't parse; no node retry (D4),
+      - the measured recursion limit `5 × (max_model_calls + 1)`, passed in the run's config,
+      - the tool details as built: escaped output, hunk headers with line numbers, `file:N (page P)` hits cut to 200 characters, filtered files readable, `list_changed_files` with no `args_schema`,
+      - the unknown-topic error row,
+      - the guards on the finding's own file, with the normalisation (D5),
+      - the replayed-request test.
+    - **§9:** the risk agent's schema failures go to the recovery call (D4).
+    - **§10.7:** one summed usage line for the agent (D3).
+    - **§12:** the span filter (5.9).
+    - **§13:** `llm.py`, `tools.py`, `risk_agent.py` and the test module.
+  - The stub wording in `nodes.py` and `config.py` was already removed in 5.7 and 5.2; a search finds none left in `src/` or the README.
+  - **Checks:** docs only; `uv run pytest -q` still passes (60).
+  - PLAN.md §7: the system prompt is static, with the PR in the first message (D2); the recursion-limit value from 5.1, and that it's passed at invoke because `create_agent` defaults to 9,999; the guards compare against the finding's own file (D5).
+  - PLAN.md §5.3 and §5.6: "*Still to verify in Phase 5*" becomes the 5.1 result.
+  - PLAN.md §9: `risk_agent` has no node retry; a bad final answer goes to the recovery call (D4).
+  - PLAN.md §10.7: one summed line for the agent (D3).
+  - PLAN.md §13: `llm.py` also exposes the agent model and middleware (D1).
+  - Remove the "Phase 5" stub wording from `nodes.py` and the `config.py` comment.
+
+- [x] **Review pass before 5.11 (Context7 + code-review + code-simplifier, your request)** ✅
+  - **Ran on the whole Phase 5 diff:**
+    - The new `tools.py` and `risk_agent.py` were marked intent-to-add (`git add -N`), so they appear in the diff. Nothing was staged or committed.
+    - **Context7:** checked our use of `ToolCallLimitMiddleware`, `ModelCallLimitMiddleware`, `Command` + `ToolMessage` from a tool, `ToolErrorMiddleware`, structured-output errors and the Langfuse span filter against the current docs. All of it matches, and our Langfuse filter is exactly the docs' v5 pattern (deny + `is_default_export_span`). One suggestion (C1, below).
+    - **code-review (level `high`):** 10 findings (R1–R10).
+    - **code-simplifier (report-only):** 13 findings (S1–S7, T1–T6).
+    - Each finding was checked against the code, and you approved the list. On R2, you chose a timeout over my recommendation to document it.
+  - **Applied, behaviour:**
+    - **R1:** `read_file_diff` bounded a page by lines only, so one minified 3 MB line went to the model whole. Every shown line is now cut at `TOOL_LINE_MAX_CHARS = 500`, with `… [N more characters]`. Quoting the visible part still matches the diff.
+    - **R2 (your decision):** a model-written regex with catastrophic backtracking could hang `search_diff`, since Python's `re` has no timeout.
+      - **New dependency `regex`** (`uv add regex`, then lowered to 2026.1.15: its PyPI floor is Python ≥3.9 where 2026.11.15 needs ≥3.11; the project itself needs ≥3.12; the timeout test and fault injection were re-run on it), a mature drop-in for `re` whose matching takes a `timeout`.
+      - *Why it's needed:* a running `re` match can't be interrupted, a thread can't be killed, a subprocess per search is heavy, and restricting the syntax would never be complete.
+      - `search_diff` gives all its matching one `SEARCH_DIFF_TIMEOUT_SECONDS = 2.0` deadline. A timeout becomes a `ToolInputError` ("the search took longer than 2s and was stopped; use a simpler pattern…"), which the agent sees as an error `ToolMessage`, and the run goes on.
+      - *Found while testing:* `regex` handles the textbook `(a+)+$` without backtracking. `(a|aa)+$` on `"a"*40 + "!"` is catastrophic in `regex` too, and is the test pattern.
+    - **R3:** evidence like `=`, or a file header (`++ b/x`), counted as **verified**. Verified findings set the minimum risk level.
+      - The guards now match only content lines (`preprocessing.diff_body_lines`: inside hunks, without markers; a malformed diff as is).
+      - Evidence must have at least `MIN_EVIDENCE_CHARS = 12` characters after normalising.
+    - **R4:** every page listed all hunk headers, uncapped. Now at most `TOOL_MAX_HUNK_HEADERS = 50` (then `+N more`), each cut like a line.
+    - **R5 (as recommended):** reading page 1 of a 10-page diff counted as a full read, so coverage was overstated.
+      - `RiskAgentState.files_inspected` is replaced by `pages_read: list[(path, page, pages)]`.
+      - The wrapper derives the **fully read** files (every page, in any order) for `files_inspected`, plus `files_partly_read`.
+      - The node traces "read only some pages of …; not counted as inspected".
+      - `ReviewState.files_inspected` keeps its meaning. PLAN §3.4, §3.5, §6 and §7 are updated.
+    - **R6:** `ToolInputError` messages quoted PR paths (the closest matches) unescaped. `on_tool_error` now escapes every message.
+    - **R7 = S2:** the tool descriptions hardcoded "400 lines" and "50 hits". They're now built from `config` with `@tool(description=…)`; the search description also states the timeout.
+    - **R8:** `read_project_context(" ")` returned the first section. A blank topic is now a `ToolInputError` listing the topics.
+  - **Applied, simplification (behaviour unchanged):**
+    - **S4 (≈ R10):** one path rule, `preprocessing.changed_files_by_path`, for the tools and the guards.
+    - **S1:** the `unparsed` flag is gone (`bad_answer is not None`), and `model_replies` is named.
+    - **S3:** `__all__` is removed, and "re-exports" becomes "imports" in the code and PLAN.
+    - **S5:** `_escape` is renamed `escape_tags`, and the wrapper is gone.
+    - **S6:** `reduce(operator.add, …)`.
+    - **S7:** `_dedupe` is gone (replaced by `_read_coverage`), PEP 8 blank lines, `any()` in `evidence_in_diff`.
+    - `read_file_diff` now returns a `DiffPage(path, pages, text)` named tuple, which R5 needs.
+  - **Applied, tests:**
+    - **T1:** the two redundant middleware patches are removed. A blanket replace would also have removed the fixture's own patch; the edit asserted the count first and caught it.
+    - **T2/T3:** the `tool_call_id` rule is now checked in **all 6** loop cases, with no magic index.
+    - **T4:** `TMR` is defined once, before `ANSWER`.
+  - **Tests:**
+    - `test_risk_tools`: a long line cut on the page (R1); 50 headers with `+10 more` and a cut header (R4); a hostile path escaped in the error (R6); the descriptions carry the `config` values (R7); a blank topic (R8); the new search cut format.
+    - New `test_search_diff_timeout` (R2):
+      - the pattern really times out in `regex`,
+      - `search_diff` with a 0.3 s limit raises `ToolInputError` in under 2 s, and `on_tool_error` gives the message,
+      - an ordinary search still works.
+    - `test_hallucination_guards_escaped_and_spans` (R3): content behind file headers is still found; the file headers, the hunk header, `context = 0` (11 characters, real but too short) and `=` aren't; a malformed diff is compared as is.
+    - New `test_risk_agent_pages_read` (R5): page 1 of 3 isn't inspected, and the trace says so; pages 3, 1, 2 (out of order) are.
+    - `test_risk_agent_request_payload` checks `pages_read == [(APP, 1, 1)]`.
+    - *Fault injection* (10 of 10 caught):
+      - R1: lines not cut,
+      - R2: no timeout (the under-2 s check failed), and a swallowed timeout,
+      - R3: headers counted, and no minimum length,
+      - R4: headers not capped, and headers not cut,
+      - R5: a partial read counted as full,
+      - R6: errors not escaped,
+      - R8: a blank topic matching.
+    - R7 has no fault injection: the descriptions are f-strings over `config`, and the test checks that they carry today's values. A stale hardcoded string equal to today's value would pass. This is noted, not tested further.
+  - **Not changed (your decision, as recommended):**
+    - **R9:** the recovery call can't reuse the agent's cache (no tools, so a different prefix). It's rare; documented.
+    - **C1:** `on_tool_error` keeps the exception message (PLAN §7); R6 escapes it.
+    - **T5:** no shared base class for the fake models.
+    - **T6:** the span-filter test is left as is.
+    - **R10, second part:** `_diff_lines` vs `_split_lines` differ on purpose.
+  - **Checks:**
+    - `uv run pytest -q` passes (**62**) with `ANTHROPIC_API_KEY` and the Langfuse keys unset,
+    - `py_compile` is clean,
+    - both Mermaid diagrams print,
+    - the tool schemas the model sees are unchanged (`[]`, `path`/`page`, `pattern`, `topic`).
+    - No paid calls; nothing committed.
+
+- [x] **5.11 Real runs on the sample (D6)** ✅
+  - `uv run python -m agent_workflow.dev_run`, with Langfuse on.
+  - **Check, and write down here:**
+    - the exit status and cost,
+    - the tool sequence (is it sensible: `must_review` first, searches that follow up on what was read?),
+    - `files_inspected`, coverage and the confidence lines,
+    - verified against unverified findings,
+    - **F1:** the synthesizer attributes findings to the right analyst,
+    - the thinking blocks survived ≥ 2 turns (no 400),
+    - with Option B, the 2nd run's cache reads on all three calls,
+    - the Langfuse trace (5.9).
+  - Judge the review's quality against the sample's real risks (the shared in-memory state across workers, `access_route[0]` behind proxies, tests). Nothing is changed to "fix" a single run's output without your approval.
+  - **Results** (2026-11-18, two runs back to back, `regex` 2026.1.15; the traces were read with the Langfuse SDK's observations API, since `/api/public/traces` returns 404 on server 4.80):
+    - **Exit status and cost:** both exit 0. Run 1 took 49 s and ~$0.20 (architecture $0.060, risk agent $0.090, synthesize $0.050). Run 2 took 41 s and ~$0.13. About $0.33 in total, below the $0.50–0.90 estimate.
+    - **Tool sequence:** sensible in both runs. The agent read the three must-review files in review order, then made one `search_diff` that followed up on what it had read (`get_host|AppContext|access_route`), then `read_project_context` (`security` and `concurrency` in run 1; `security` in run 2). Tool calls: 6 and 5 out of 14, none blocked, no tool errors. Model calls: 4 and 3 out of 16. No recovery call.
+    - **Coverage and confidence:** `pages_read` shows page 1 of 1 for all three files, so all three were read in full and none was partly read. Both runs: the model's confidence was 0.85, minus 0.05 for a core file whose callers are outside the diff, giving 0.80.
+    - **Verified against unverified:** 7 of 7 findings verified in each run. Nothing was dropped or demoted. Max severity was high.
+    - **F1 (attribution):** correct in both runs.
+      - Shared findings (the `access_route[0]` key, the unbounded `_requests` dict, the unlocked app state) are credited to both analysts, and each analyst did report them.
+      - The `get_host` finding is credited to the risk reviewer alone, and is correctly called an assumption.
+    - **Thinking blocks:** the thinking block (with its signature) from the risk agent's turn 2 was sent unchanged in turns 3 and 4 (run 1) and turn 3 (run 2). The API accepted it, with no 400. This closes the real-API check left open in 5.1.
+    - **Cache across runs:** run 2 read from the cache on all three calls: architecture 4,323 tokens, risk agent 14,910 of 15,959, synthesize 1,705.
+    - **Langfuse trace (5.9):** one generation per Claude call (6 and 5). The agent's turns and tool spans are nested under `risk_agent`. `test_tracing_is_optional` still passes (full suite: 62).
+    - **Quality:** both runs flag all three real risks:
+      - `access_route[0]` / `X-Forwarded-For` spoofing, rated high;
+      - per-worker in-memory state and the unlocked swap on the app object;
+      - the thin tests.
+      They also flag:
+      - the unbounded `_requests` dict, which forged keys can grow (a DoS);
+      - the check running before `request_started` and `before_request`, on static files and OPTIONS requests too;
+      - the missing `Retry-After` header;
+      - `bool` being accepted as an int in the config check;
+      - the missing docs, `CHANGES.rst` entry and `versionadded` markers.
+      Final output: `high`, complexity 5.5, confidence 0.80 in both runs.
+    - **Run-to-run variance:** the final fields are identical. Severities shift: unbounded memory high, then medium; `get_host` medium, then low. Run 2 adds the docstring-vs-algorithm mismatch (fixed window vs sliding log). Run 1 adds the `bool`/int check.
+    - **Open, not changed:** the `get_host` finding can't be settled from the diff. The PR adds no import for it, but `app.py` may already import it outside the hunks. Both runs label it an assumption, which is the intended behaviour. No change made.
+
+- [x] **5.12 Final review pass and phase check** ✅
+  - code-review (level `high`) and code-simplifier (report-only) on the whole Phase 5 diff. Each finding is checked against the code; you approve the list; then the fixes are applied, each with a test or a reason.
+  - `uv run pytest -q` passes, `py_compile` is clean, both Mermaid diagrams print, and `git diff` is inspected.
+  - Tick the sub-tasks here, and set the Phase 5 status in the overview. Report, then stop for review.
+  - **Results** (approved: all proposed fixes and cleanups; CR2 as option A, your decision after asking whether the total tool output is bounded):
+    - **CR1, regex compile cost:** `search_diff` rejects a pattern over 500 characters, or one whose counted repeats multiply to more than 1,000, before compiling it. The `regex` timeout covers only matching, and compiling expands counted repeats: the reviewer's `(?:x{60000}){60000}` killed the process.
+      - The limit is 1,000, not the 10,000 proposed. Measured: at 10,000, an element-heavy body (`a?` × 230) compiled to ~1 GB; at 1,000 the worst case is < 0.1 s and ~125 MB.
+      - Counting every repeat as if nested over-counts side-by-side ones, which is the safe side.
+    - **CR2, bounded tool output (option A):**
+      - Every tool result, error messages included, is at most `TOOL_RESULT_MAX_CHARS` = 20,000 characters, so a run's executed tool output is at most 30 × 20,000 = `TOOL_OUTPUT_TOTAL_MAX_CHARS` = 600,000 characters (~150–200K tokens; Opus 5.5 has a 1M window). A test keeps the product at or under that ceiling.
+      - A diff page ends after 400 lines or at 18,000 characters, and every line stays on some page. Page 1's room is smaller by the header list's longest possible length. `search_diff` uses the same page numbers (one shared `_paging`).
+      - Long lists (`list_changed_files`, search hits) stop on a whole line with "N more … not shown". A final cut enforces the cap for pathological input (a 30,000-character path).
+      - No running count in the agent's state (option B, not chosen).
+      - Normal code (~50 characters a line) now gets ~370 lines a page instead of 400.
+    - **CR5:** the `search_diff` description says lines keep their `+`/`-`/space marker (`^[+ -]def`, not `^def`).
+    - **CR6:** only page 1 lists the hunk headers (each cut at 120 characters, `TOOL_HUNK_HEADER_MAX_CHARS`), with the page each is on. Later pages say "listed on page 1".
+    - **CR9:** PLAN.md §7 now names `pages_read` as the reducer.
+    - **Cleanups (no behaviour change):**
+      - S1: one `_structured` helper behind `structured_call` and `structured_call_messages`. It doesn't delegate to `structured_call_messages`, which the test fixture patches.
+      - S2: the redundant `bad_answer` guard is gone.
+      - S3: the path is normalised once.
+      - S5: the timeout error is raised directly.
+      - S6: the partly-read list is built like the fully-read one.
+      - S7: the read line is a named variable.
+      - S8 and S4/CR8: docstrings fixed, and `search_diff` uses `changed_files_by_path`.
+    - **Skipped, with reasons (approved):** CR3 (recovery after `max_tokens`), CR4 (evidence from removed lines is intended), CR7 (the blocked-call text is pinned by a test against the real middleware), CR10 (negligible cost).
+    - **Verification:**
+      - `test_tool_output_bounds` is new; `test_risk_tools` was updated for the header format.
+      - **Fault injection:** 11 of 11 caught: three for CR1, six for CR2, one for CR6, one for CR5. In the CR1 test, `regex.compile` is replaced by a failure, so a missing check fails the test without compiling the dangerous pattern.
+      - Full suite: 63 passed, with the API and Langfuse keys unset. `py_compile` is clean; both Mermaid diagrams print; ruff (F rules) is clean; the tool schemas the model sees are unchanged.
+      - No paid calls; nothing committed.
+    - **Not verified on the real API:** the new descriptions and the 18,000-character pages haven't been seen by the model. On the sample, every file is one page, as before.
+
+**Noted, not in scope:**
+- **Architecture findings stay unchecked.** §7 puts the guards on the risk agent only, and `_finding_line` already labels which side is checked.
+- **A secret quoted in a finding's evidence or reasoning** can reach the synthesizer prompt, and so the model's text. This was already true of the architecture analyst. The trace stays clean (5.6, 5.7). Whether to redact model text is a separate decision for you, not part of this phase.
+
+**Out of scope for Phase 5:**
+- Jev (Phase 6),
+- turning a failed `risk_agent` into a degraded node, plus exit codes and the CLI (Phase 7),
+- retry, summarization or context-editing middleware (§11),
+- new tools beyond the 4 in §7.
 
 ## Phase 6: Jev router
 **Files:** `router.py` (Jev client, threshold, fallbacks).

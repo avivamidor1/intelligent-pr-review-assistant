@@ -1,9 +1,12 @@
 """The LLM boundary (docs/PLAN.md §5, §9, §10).
 
-Graph nodes call only `structured_call` and see only what this module defines: the
-`Effort` levels, `Usage`, and the `LLMError` family. Everything provider-specific stays
-private below: the Claude model, prompt caching, the refusal fallback, the provider's usage
-fields and prices. Adding another provider later means changing this module, not the graph.
+Graph nodes call only `structured_call` (and, for the risk agent's recovery call,
+`structured_call_messages`) and see only what this module defines: the `Effort` levels,
+`Usage`, and the `LLMError` family. The risk agent (create_agent) also gets its chat model
+and the provider's middleware from here (`agent_model`, `agent_middleware`, `usage_of`).
+Everything provider-specific stays in this module: the Claude model, prompt caching, the
+refusal fallback, the provider's usage fields and prices. Adding another provider later
+means changing this module, not the graph.
 
 Anthropic (Claude Opus 5.5) is the only provider. Behaviour verified in Phase 4.1:
 - structured output is native JSON schema (`output_config.format`); forced tool use is a 400,
@@ -18,8 +21,11 @@ import os
 from dataclasses import dataclass
 from typing import Any, Literal, TypeVar
 
+from langchain.agents.middleware import AgentMiddleware
 from langchain_anthropic import ChatAnthropic
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_anthropic.middleware import AnthropicPromptCachingMiddleware
+from langchain_core.language_models import BaseChatModel
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 from pydantic import BaseModel
 
 from . import config
@@ -51,6 +57,17 @@ class Usage:
     output_tokens: int  # includes thinking
     cost_usd: float  # an estimate from list prices, never billing
 
+    def __add__(self, other: Usage) -> Usage:
+        """Two calls' usage summed: the risk agent's calls go in one trace line (D3)."""
+        return Usage(
+            model=self.model if self.model == other.model else "mixed",
+            input_tokens=self.input_tokens + other.input_tokens,
+            cache_read_tokens=self.cache_read_tokens + other.cache_read_tokens,
+            cache_write_tokens=self.cache_write_tokens + other.cache_write_tokens,
+            output_tokens=self.output_tokens + other.output_tokens,
+            cost_usd=self.cost_usd + other.cost_usd,
+        )
+
     def trace_line(self, label: str) -> str:
         total_in = self.input_tokens + self.cache_read_tokens + self.cache_write_tokens
         return (
@@ -68,8 +85,45 @@ def structured_call(
     Raises LLMRefusal, LLMSchemaError, or LLMError (e.g. the output hit max_tokens).
     Transient API errors are retried inside the provider's SDK before anything is raised.
     """
+    return _structured(schema, effort, _messages(system, user))
+
+
+def structured_call_messages(
+    schema: type[SchemaT], *, effort: Effort, system: str, messages: list[BaseMessage]
+) -> tuple[SchemaT, Usage]:
+    """Like `structured_call`, over an existing conversation: the risk agent's recovery call
+    (§7), which asks for the final answer over the agent's own history. No tools are sent
+    (verified in Phase 5.1); the history's thinking blocks are passed back unchanged."""
+    return _structured(schema, effort, [_system(system), *messages])
+
+
+def _structured(schema: type[SchemaT], effort: Effort, messages: list[BaseMessage]) -> tuple[SchemaT, Usage]:
+    """The one place a structured call is made: JSON-schema output, raw message kept for usage."""
     model = _claude(effort).with_structured_output(schema, method="json_schema", include_raw=True)
-    return _interpret(model.invoke(_messages(system, user)))
+    return _interpret(model.invoke(messages))
+
+
+# ---------------------------------------------------------------------------
+# The risk agent (create_agent) needs the chat model itself and the provider's middleware
+# (D1). They are built here, so the rest of the code never imports the provider.
+# ---------------------------------------------------------------------------
+
+
+def agent_model(effort: Effort) -> BaseChatModel:
+    """The chat model for the risk agent's loop: the same Claude configuration as
+    `structured_call` (effort, max_tokens, SDK retries, the refusal fallback)."""
+    return _claude(effort)
+
+
+def agent_middleware() -> list[AgentMiddleware]:
+    """The provider's middleware for the agent: prompt caching of the system prompt, the
+    tool definitions and the growing message history (§5.5)."""
+    return [AnthropicPromptCachingMiddleware(ttl="5m")]
+
+
+def usage_of(message: AIMessage) -> Usage:
+    """One agent model call's usage, from the API's own usage fields (see `_usage`)."""
+    return _usage(message.response_metadata)
 
 
 # ---------------------------------------------------------------------------
@@ -93,12 +147,14 @@ def _claude(effort: Effort) -> ChatAnthropic:
     )
 
 
+def _system(system: str) -> SystemMessage:
+    """The static system prompt, with the cache breakpoint."""
+    return SystemMessage(content=[{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}])
+
+
 def _messages(system: str, user: str) -> list[SystemMessage | HumanMessage]:
     """The static system prompt first, with the cache breakpoint; the PR content after it."""
-    return [
-        SystemMessage(content=[{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}]),
-        HumanMessage(content=user),
-    ]
+    return [_system(system), HumanMessage(content=user)]
 
 
 def _usage(metadata: dict[str, Any]) -> Usage:

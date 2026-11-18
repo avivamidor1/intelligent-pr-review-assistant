@@ -251,8 +251,8 @@ def confidence_signals(
 ) -> ConfidenceSignals:
     """Map the review's state to the §8 confidence signals.
 
-    `degraded` holds node names. Until the Phase 5 guards run, every risk finding counts as
-    unverified (`verified` defaults to False): the conservative default. `truncated` covers
+    `degraded` holds node names. A risk finding is unverified unless the guards
+    (risk_agent.apply_guards) found its evidence in its file's diff. `truncated` covers
     malformed or missing diffs, and `diffs_cut`: files the route's diff budget left out of
     the LLM call that reviews raw diffs (the architecture analyst, or the simple-path
     synthesizer).
