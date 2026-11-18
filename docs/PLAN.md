@@ -26,7 +26,7 @@ The output fields are `risk_level`, `risk_reasoning`, `architectural_impact`, `r
 | langchain-core + langchain-anthropic | `ChatAnthropic`, message types, `with_structured_output` for the single-call nodes, and `AnthropicPromptCachingMiddleware` for the agent | Yes |
 | python-dotenv | Load `.env` | Yes |
 | regex | The risk agent's `search_diff` (§7): a drop-in for `re` whose matching takes a **timeout**. The pattern is model-written and runs over untrusted PR text, so catastrophic backtracking must not hang the review. Python's `re` has no timeout and can't be interrupted, and a thread can't be killed. Added in the Phase 5 review (R2); the timeout covers matching only, so compile cost is bounded by pattern limits (5.12 review, CR1). | Yes |
-| Jev client (TypeSafe) | Decision model for routing. It's **optional**: without `JEV_API_KEY` the router uses rules only. The client (official SDK or plain HTTP) is chosen after reading the official docs in step 6. | Yes (optional) |
+| httpx (Jev client) | Routing's decision model, Jev by TypeSafe (§3.3): one `POST /v1/systemone` to the pinned `jev-1.14.0`, with our own 3 s per-phase timeout and single retry. It's **optional**: without `JEV_API_KEY` the router uses rules only. Plain HTTP rather than the `typesafe-sdk`, whose built-in retries would be a second, unreviewed retry layer (Phase 6, D1); `httpx` was already installed through `anthropic`, and its `MockTransport` tests every failure offline. | Yes |
 | langfuse | Local tracing for development only. It goes in a separate `uv` dependency group, is excluded from `requirements.txt`, and is enabled only when its keys are set. | No |
 
 `langchain-openai` is removed.
@@ -70,7 +70,12 @@ START → parse_pr → classify_pr ─┬─ simple ─────────�
 - **Three lanes with a per-file triage pre-scan via `Send`** (an earlier version of this plan). It cut costs only on 100-file PRs, but added two nodes, a clustering algorithm and a second model. It was removed: the risk agent already pulls diffs on demand, and the 1M-token context fits large PRs.
 - **A hand-built ReAct subgraph for the risk agent** (an earlier version of this plan). It made every rule our own code, but it reimplemented about 150 lines that `create_agent` already provides and tests: tool dispatch with one `ToolMessage` per call, unknown-tool and invalid-argument errors, call limits, and the structured final answer. With `create_agent`, each of those rules is still chosen explicitly through named middleware and covered by our tests (§7). The trade-off is that the loop's mechanics live in library code, so we pin the version and test the behaviour we rely on.
 - **Claude as the router.** Claude doesn't expose token probabilities, so we'd get a self-reported confidence rather than a calibrated one. A decision model returns a real probability.
-- **Jev for every routing decision.** Rules are free, exact and deterministic for the clear cases, so Jev is used only where the rules can't decide.
+- **Jev for every routing decision.** Not because of cost: a call is about $0.00003 and 0.2–0.7 s (measured, Phase 6), next to cents and tens of seconds for the LLM nodes. Jev is asked only where its answer can change the route:
+  - **The rules are one-way, on purpose.** Jev must not downgrade a rule-decided `complex` PR (core, sensitive, new or deleted module, large, scan hit), or a description saying "trivial, skip review" could steer the routing. On those PRs, its answer would be computed and ignored.
+  - **Data goes out only when it matters.** Rule 1 fires on detected secrets and injection-like text. Asking Jev on every PR would send exactly the PRs known to hold a credential to a third party.
+  - **Large PRs don't fit the question.** Their diffs exceed the payload limit, so Jev would judge part of the change, and "light or full review?" is already answered.
+  - The only safe extra use would be upgrading a rule-`simple` PR (docs or lockfile only) to `complex`. It's not built: the simple path already has Claude review those diffs, and Jev wouldn't see a lockfile's content (mechanical files send no diff).
+  - A "shadow mode" (ask on every eligible PR, log only, to measure the rules) is an evaluation feature (§11).
 
 ---
 
@@ -133,14 +138,22 @@ The routing decision has three layers, from safest to least safe.
 Code files are source, config and test files. The thresholds live in `config.py`. A dependency-only PR (`requirements*.txt` is config) has no special rule: it lands in the uncertain middle. A lockfile-only PR is mechanical and routes `simple`.
 
 **Layer 2: the decision model (Jev)**, only for the **uncertain middle**: small code changes (≤3 code files, ≤50 changed lines, nothing core, sensitive or new). Here rules can't tell a comment typo or version bump from a real logic change.
-- **Input:** a bounded payload. It holds the title, the description (truncated), the file list with categories and +/- counts, and the changed lines (up to about 2K tokens).
-- **Question:** *"Does this change need a full review (complex) or a light review (simple)?"*
-- **Output:** `P(simple)`.
+- **Input (`router.jev_request`):** a bounded, deterministic payload in Jev's `state` field, never in the question. It holds:
+  - the title (cut at 300 characters) and the description (cut at 1,500), each with an "… [N more characters]" marker,
+  - up to 20 files, code first, with the derived status, category and recomputed +/- counts,
+  - the hunks (`@@` headers, context and +/- lines) of the non-filtered code files only. Docs and mechanical files are listed but send no diff text.
+  - Measured on 3 PRs: 1.2–1.4K characters, about 600 input tokens.
+- **When Jev isn't asked** (the PR routes `complex`):
+  - **The payload is over its limit:** the code hunks exceed 8,000 characters (≈ 2K tokens), so Jev would judge a half-seen change.
+  - **A secret rule matches a line that would be sent:** a removed or context line, or a hunk header. `scan_pr` checks added lines only, because deleting a secret is a fix, but the payload sends whole hunks. This way no detected credential leaves the machine (Phase 6.10, CR1).
+- **Question:** one yes/no question (a Noul) named `light_review_enough`: *"Can this pull request be approved after a light review, without a full code review?"* It has criteria for yes (comments, docstrings, message typos, formatting, …) and no (conditions, control flow, error handling, API, behaviour-changing config or dependencies, or anything that can't be judged). It's phrased so that "yes" means simple, and it lives in `router.py`, next to the payload: `prompts.py` imports `router.py`, so the reverse import would be circular.
+- **Output:** `answers.light_review_enough.noul`, which is `P(simple)`. It's validated strictly (a number in [0, 1]; not `true`, `"0.9"` or NaN). An answer from another model than the pinned one isn't used, because the threshold and the wording were checked on the pinned model only. `usage` only feeds the cost line, so it's best-effort: a missing count never discards an answer.
+- **Model:** the pinned `jev-1.14.0`. `jev-latest` is an alias that moves with each release, which would change routing with no code change.
 
 **Layer 3: the fallback**
-- `P(simple) ≥ 0.85` → `simple` (the threshold is in config).
+- `P(simple) ≥ 0.85` → `simple`. The threshold is in config, and `JEV_THRESHOLD` overrides it within [0.5, 1.0]; any other value is a configuration error. It's higher than the docs' suggested 0.7 on purpose, because the two mistakes don't cost the same (below).
 - Otherwise → `complex`.
-- **Jev unavailable** (no `JEV_API_KEY`, a timeout of about 3s, an API error or an unexpected response) → `complex`. This is a safe default, not a degraded stage.
+- **Jev unavailable or not asked** (no `JEV_API_KEY`, an invalid `JEV_THRESHOLD`, a client that can't be created, a timeout, an API error, an unexpected response or model, a payload over its limit, or a secret in a line that would be sent) → `complex`. This is a safe default, not a degraded stage (§9). Routing never raises over Jev: Jev is optional, and a configuration problem shows as a warning in the trace.
 
 **Why the design is safe:**
 - **The two kinds of mistake don't cost the same.** A simple PR on the complex path costs cents. A risky PR on the simple path is a missed risk. So every uncertain case goes to `complex`.
@@ -152,16 +165,17 @@ Code files are source, config and test files. The thresholds live in `config.py`
 
 Every decision goes into the trace with its source:
 - *"Route: complex (rule: core file `src/flask/app.py`)."*
-- *"Route: simple (Jev, p=0.93): 1 file, 2 lines changed."*
-- *"Route: complex (fallback: Jev unavailable)."*
+- *"Route: simple (Jev, p=0.93): threshold 0.85; 1 code file, 2 changed code lines."* Jev returns 2 decimals, and the comparison uses the raw value.
+- *"Route: complex (fallback: uncertain middle; Jev unavailable: timeout after 2 attempts)."*
+- After a Jev call, one audit line: *"Jev: jev-1.14.0, 1 attempt, 0.71 s, 615 input tokens (~$0.00003)."* On a 4xx or a malformed answer, a warning follows it. Neither ever holds the key or the response body.
 
 | PR | Route |
 |---|---|
 | Docs only | simple (rule) |
 | Docs only, but one contains an API key | complex (rule) |
 | Lockfile only (dependency bump) | simple (rule); the review names the dependency update |
-| A typo fixed in a comment in one `.py` file | Jev decides, which is likely simple |
-| A one-line condition change in a helper | Jev decides, which is likely complex |
+| A typo fixed in a comment in one `.py` file | Jev decides: simple (p = 0.98, Phase 6.1) |
+| A one-line condition change in a helper | Jev decides: complex (p = 0.14–0.16, Phase 6.1) |
 | 3 docs + 2 source (rate limiter, new module) + 1 test | complex (rule: new module) |
 | 25 source files | complex (rule) |
 
@@ -201,7 +215,7 @@ There is no GitHub access, which the assignment requires, so the system **never 
 
 | Node | Model | Effort | Why |
 |---|---|---|---|
-| `classify_pr` | **Jev** (TypeSafe decision model) | n/a | Returns a probability for one decision. It's fast (vendor-reported 70–500ms) and cheap. The calibrated probability is what makes a threshold and a fallback possible. |
+| `classify_pr` | **Jev** (TypeSafe decision model, `jev-1.14.0`) | n/a | Returns a probability for one decision. It's fast (measured 0.2–0.7 s) and cheap (about $0.00003 a call). The probability, which the vendor says is trained to be calibrated, is what makes a threshold and a fallback possible. |
 | `architecture_analyst` | Claude Opus 5.5 (`claude-opus-5-5`) | medium | One focused judgment call |
 | `risk_agent` | Claude Opus 5.5 | **high** | Multi-step tool use and the hardest reasoning |
 | `synthesize` (simple path) | Claude Opus 5.5 | low | A small diff that needs a short review |
@@ -222,15 +236,23 @@ One Claude model means one prompt cache and one set of behaviours to handle. Mod
 7. **`max_tokens` of about 16K** per call, because thinking counts toward it.
 8. **1M context:** even huge PRs fit. The budgets exist for **focus and cost**, not to fit the window.
 
-### Jev: to verify in step 6 before writing any code
-- the endpoint, authentication, request and response format, and pricing, all from the official docs,
-- how a binary decision and its probability are expressed,
-- whether the vendor's latency and accuracy claims hold on our inputs. These come from vendor and blog sources and haven't been independently verified.
+### Jev: verified in Phase 6 (official docs at docs.typesafe.ai, then real calls)
+- **API:** `POST https://api.typesafe.ai/v1/systemone`, with `Authorization: Bearer <key>`. The body is `{model, state, questions}`. A yes/no question is a Noul, and its answer is `answers.<name>.noul`, a number in [0, 1].
+  - The real response: `{"model": "jev-1.14.0", "answers": {"light_review_enough": {"type": "noul", "noul": 0.98}}, "usage": {"input_tokens": 615, "output_tokens": 23}}`.
+- **Pricing:** $0.042 per million input tokens; output is free.
+- **Measured** (3 PRs × 3 calls, plus one call through the router):
+  - `noul` came back with 2 decimals, and spread by at most 0.02 over repeats,
+  - the comment typo scored 0.98, the condition change 0.14–0.16, and the dependency pin bump 0.07–0.08,
+  - latency was 0.20–0.42 s on a reused connection, and 0.71 s with a new one.
+- **Errors:** a 401 body is `{"detail": {"error_type", "message"}}`. The docs list 400/401/413/415/422/429/529, and advise backoff for 429/529.
+- **Data:** the docs say Jev isn't trained on customer requests or responses. They state no retention period, and zero data retention is offered to enterprise customers only.
+- **Not verified:** accuracy beyond these few cases (the threshold isn't tuned on them), and a real timeout, 5xx or 429. Those paths are covered by offline tests.
+- `GET /v1/models` lists only the aliases (`jev-latest`, `jev-preview`). The pinned ID is still accepted, and the response's `model` confirms it.
 
 **Rough cost:**
 - the sample PR (complex path): about $0.25–0.40 per run,
 - a simple-path PR: a few cents (one low-effort call),
-- a Jev call: verify in step 6.
+- a Jev call: about $0.00003 (~600 input tokens).
 
 ---
 
@@ -501,9 +523,14 @@ Each adjustment is written to the trace.
 | Failure | Handling |
 |---|---|
 | No `JEV_API_KEY` | Rules only; the uncertain middle goes to `complex`. Noted in the trace. |
-| Jev timeout (~3s), connection error or 5xx | 1 quick retry, then `complex` |
-| Jev 4xx or an unexpected response shape | `complex` immediately, with a warning in the trace |
+| Jev timeout, connection error or 5xx (529 included) | 1 immediate retry, then `complex`. The trace names each attempt's failure when they differ ("timeout, then HTTP 503"). The 3 s timeout applies to each request phase (connect, write, read) and restarts on every chunk read, so it's **not a deadline**: a server that trickles bytes can take longer. An overall cap would need a thread or async, and isn't built (Phase 6.10, CR4). |
+| Jev 4xx (429 included: a 3 s router can't usefully wait out a rate limit) or an unexpected response shape | `complex` immediately, with a warning in the trace |
+| Code diffs over the payload limit (8,000 characters) | `complex`; Jev isn't asked |
 | `P(simple)` below the threshold | `complex` |
+| `JEV_THRESHOLD` not a number in [0.5, 1.0] | `complex`, with a warning naming the bad value. It's never silently replaced with the default, and it doesn't crash the run (Phase 6.10, CR2) |
+| The Jev client can't be created (a non-ASCII character in the key, a malformed proxy setting) | `complex`, with a warning naming the error type, never its message |
+| Jev answers with a model other than the pinned one | `complex` immediately, with a warning |
+| A secret rule matches a removed or context line of an uncertain-middle PR | `complex`; Jev isn't asked |
 
 A routing fallback is a **safe default, not a degradation**. The review is still full, so the exit code stays 0.
 
@@ -548,7 +575,7 @@ A routing fallback is a **safe default, not a degradation**. The review is still
 4. **Cheap decisions first:** the rules are free, and Jev is called only for the uncertain middle.
 5. **Prompt caching:** static-first prompt order, plus `AnthropicPromptCachingMiddleware` in the agent loop, so each turn reuses the cached history.
 6. **Budgets that scale with the PR,** within hard caps.
-7. **Usage accounting:** tokens in/out and estimated cost go into the trace, which works without Langfuse. One line per LLM call, from `llm.Usage.trace_line` (Phase 4). The risk agent's calls are summed into one line (`LLM risk_agent (N calls): …`), plus its own line for a recovery call, so a 16-call agent doesn't take 16 trace steps. The per-call detail is in Langfuse. The cost is an estimate from Opus 5.5 list prices in `config.py`.
+7. **Usage accounting:** tokens in/out and estimated cost go into the trace, which works without Langfuse. One line per LLM call, from `llm.Usage.trace_line` (Phase 4). The risk agent's calls are summed into one line (`LLM risk_agent (N calls): …`), plus its own line for a recovery call, so a 16-call agent doesn't take 16 trace steps. The per-call detail is in Langfuse. The cost is an estimate from Opus 5.5 list prices in `config.py`. A Jev call gets its own line too (model, attempts, latency, input tokens, cost; §3.3).
 
 ---
 
@@ -585,8 +612,8 @@ docs/PLAN.md
 src/agent_workflow/
   config.py          # models, effort per node, routing thresholds, Jev threshold, weights, budgets
   llm.py             # the LLM boundary: provider-neutral structured_call(+_messages), Usage, LLMError family; the agent's model and provider middleware (agent_model, agent_middleware); Claude (ChatAnthropic, effort, fallbacks, caching) behind it, the only module importing the provider
-  router.py          # classify_pr: hard rules, Jev client, fallback
-  schemas.py         # Pydantic models (raw input, file classification, stats, plan, route decision, findings, draft, output)
+  router.py          # classify_pr: hard rules; Jev (question, bounded payload, httpx client with timeout and one retry, threshold); fallback
+  schemas.py         # Pydantic models (raw input, file classification, stats, plan, route decision, Jev response, findings, draft, output)
   state.py           # ReviewState + reducers
   prompts.py         # all prompts (static content first)
   preprocessing.py   # normalize, noise filter, classify, priority, review plan, scans, API surface
@@ -599,7 +626,7 @@ src/agent_workflow/
   dev_run.py         # dev runner: graph on a PR file, traced (until the Phase 7 CLI)
   project_context.md # Flask conventions + core path patterns (swappable)
 langfuse/                        # dev only: local Langfuse (official docker-compose.yml + .env.example)
-tests/test_pipeline.py           # one test module: the deterministic layer, the graph's two paths, the agent's tools, loop and guards (fake LLMs, a scripted agent model), no API key
+tests/test_pipeline.py           # one test module: the deterministic layer, the graph's two paths, the agent's tools, loop and guards, Jev routing (fake LLMs, a scripted agent model, a mock Jev transport), no API key and no network
 ```
 
 ---
@@ -610,4 +637,4 @@ Implementation phases, their checks and progress are tracked in [`docs/phases.md
 
 ## 15. Before we start
 - **Step 1:** put the full `pr_input.json` in the repo root, and add `ANTHROPIC_API_KEY` to `.env`.
-- **Step 6 (optional):** add `JEV_API_KEY` to `.env`. Without it, the router runs on rules plus the `complex` default.
+- **Step 6 (optional):** add `JEV_API_KEY` (a TypeSafe API key) to `.env`. Without it, the router runs on rules plus the `complex` default.

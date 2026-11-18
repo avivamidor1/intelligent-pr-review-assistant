@@ -96,8 +96,8 @@ def parse_pr(state: ReviewState) -> dict[str, Any]:
 
 def classify_pr(state: ReviewState) -> dict[str, Any]:
     """Choose the simple or complex path (§3.3). The conditional edge after it reads `route`."""
-    route = decide_route(state["classifications"], state["stats"])
-    return {"route": route, "reasoning_trace": [describe_route(route)]}
+    route, notes = decide_route(state["pr"], state["classifications"], state["stats"])
+    return {"route": route, "reasoning_trace": [describe_route(route), *notes]}
 
 
 # ---------------------------------------------------------------------------
