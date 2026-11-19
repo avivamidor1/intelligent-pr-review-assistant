@@ -5,7 +5,9 @@
   retry policy on the LLM nodes,
 - the LLM nodes' deterministic inputs and prompts, and the draft limits finalize enforces,
 - the risk agent's tools and its loop (a scripted chat model: budgets, recovery, errors),
-- that Langfuse tracing stays optional.
+- that Langfuse tracing stays optional,
+- degradation (a node failing after its retries) and the CLI: input checks, exit codes,
+  the atomic write.
 
 The assignment asks for no extensive test suite ("one simple test is fine"), so this is a
 few small, mostly parametrized tests over representative PRs.
@@ -14,18 +16,23 @@ few small, mostly parametrized tests over representative PRs.
 from __future__ import annotations
 
 import json
+import os
 import re
+import stat
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+import anthropic
 import httpx
+import httpx2
 import pytest
+from langgraph.errors import GraphRecursionError
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
 
-from agent_workflow import config, llm, nodes, prompts, risk_agent, router, tools
+from agent_workflow import cli, config, llm, nodes, prompts, risk_agent, router, tools
 from agent_workflow.graph import build_graph
 from agent_workflow.observability import get_langfuse_handler, traced_run
 from agent_workflow.preprocessing import api_surface, hunks_text, load_core_patterns, preprocess, select_diffs
@@ -277,7 +284,8 @@ def test_graph_paths(
     assert ran.count("synthesize") == ran.count("validate") == synth_runs
     assert ran[-1] == "finalize"
 
-    assert set(result) == {"output"}  # the output schema hides the internal state
+    assert set(result) == {"output", "degraded", "fallback"}  # the output schema hides the internal state
+    assert result["degraded"] == [] and result["fallback"] is False
     output = result["output"]
     assert isinstance(output, ReviewOutput)
     assert output.complexity_score == complexity
@@ -572,23 +580,24 @@ def test_prompt_data_blocks() -> None:
 
 
 @pytest.mark.parametrize(
-    ("error", "failures", "attempts", "succeeds"),
+    ("error", "failures", "attempts", "degrades"),
     [
-        pytest.param(llm.LLMSchemaError, 1, 2, True, id="schema mismatch once: retried, then succeeds"),
-        pytest.param(llm.LLMSchemaError, 9, 2, False, id="schema mismatch every time: gives up after 2 attempts"),
-        pytest.param(llm.LLMRefusal, 1, 1, False, id="refusal: never retried"),
-        pytest.param(llm.LLMError, 1, 1, False, id="other LLM error (e.g. max_tokens): not retried"),
+        pytest.param(llm.LLMSchemaError, 1, 2, False, id="schema mismatch once: retried, then succeeds"),
+        pytest.param(llm.LLMSchemaError, 9, 2, True, id="schema mismatch every time: gives up after 2 attempts"),
+        pytest.param(llm.LLMRefusal, 1, 1, True, id="refusal: never retried"),
+        pytest.param(llm.LLMError, 1, 1, True, id="other LLM error (e.g. max_tokens): not retried"),
     ],
 )
 def test_llm_retry_policy(
     error: type[Exception],
     failures: int,
     attempts: int,
-    succeeds: bool,
+    degrades: bool,
     monkeypatch: pytest.MonkeyPatch,
     llm_calls: list[LLMCall],
 ) -> None:
-    """RetryPolicy on the LLM nodes retries only a schema mismatch, once (§9)."""
+    """RetryPolicy on the LLM nodes retries only a schema mismatch, once (§9). A failure
+    left after that degrades synthesize to the fallback review (Phase 7)."""
     fake = llm.structured_call  # the autouse fake (llm_calls is requested first)
 
     def flaky(schema: type, **kwargs: str) -> tuple[object, llm.Usage]:
@@ -602,11 +611,11 @@ def test_llm_retry_policy(
     monkeypatch.setattr(llm, "structured_call", flaky)
     docs_only = _pr(_file("README.md", ["fix"], ["fxi"])).model_dump()  # simple path: synthesize only
 
-    if succeeds:
-        assert isinstance(build_graph().invoke({"raw_pr": docs_only})["output"], ReviewOutput)
-    else:
-        with pytest.raises(error):
-            build_graph().invoke({"raw_pr": docs_only})
+    result = build_graph().invoke({"raw_pr": docs_only})
+    assert isinstance(result["output"], ReviewOutput)
+    assert result["degraded"] == (["synthesize"] if degrades else [])
+    assert result["fallback"] is degrades
+    assert (result["output"].confidence == config.FALLBACK_CONFIDENCE) == degrades
     assert len(llm_calls) == attempts
 
 
@@ -1607,3 +1616,498 @@ def test_graph_jev_paths(monkeypatch: pytest.MonkeyPatch, llm_calls: list[LLMCal
     expected_effort = config.EFFORT_SYNTH_COMPLEX if analysts_ran else config.EFFORT_SYNTH_SIMPLE
     assert [c.effort for c in synth] == [expected_effort]
     assert all(("<pr_diff" in c.user) == (not analysts_ran) for c in synth)  # simple path: synthesize sees the diff
+
+
+# ---------------------------------------------------------------------------
+# Phase 7: degradation and the CLI
+# ---------------------------------------------------------------------------
+
+_REQUEST = httpx2.Request("POST", "https://api.anthropic.com/v1/messages")
+
+
+def _api_error(cls: type[anthropic.APIStatusError], status: int) -> anthropic.APIStatusError:
+    """An SDK status error as the SDK raises it (the SDK uses httpx2, 7.1)."""
+    return cls("injected", response=httpx2.Response(status, request=_REQUEST), body=None)
+
+
+@pytest.mark.parametrize(
+    ("error", "degradable"),
+    [
+        pytest.param(llm.LLMRefusal("x"), True, id="refusal"),
+        pytest.param(llm.LLMSchemaError("x"), True, id="schema mismatch"),
+        pytest.param(llm.LLMError("x"), True, id="other LLM error"),
+        pytest.param(_api_error(anthropic.InternalServerError, 500), True, id="500 after the SDK's retries"),
+        pytest.param(_api_error(anthropic.RateLimitError, 429), True, id="429 after the SDK's retries"),
+        pytest.param(anthropic.APITimeoutError(_REQUEST), True, id="timeout"),
+        pytest.param(_api_error(anthropic.NotFoundError, 404), True, id="404 (unknown model)"),
+        pytest.param(_api_error(anthropic.AuthenticationError, 401), False, id="401: fatal"),
+        pytest.param(_api_error(anthropic.PermissionDeniedError, 403), False, id="403: fatal"),
+        pytest.param(KeyError("x"), False, id="a bug"),
+        pytest.param(GraphRecursionError("x"), False, id="recursion: only the risk agent's handler allows it"),
+    ],
+)
+def test_is_degradable(error: BaseException, degradable: bool) -> None:
+    """Which failures a node survives as a degraded stage (D2)."""
+    assert llm.is_degradable(error) is degradable
+
+
+def _inject(monkeypatch: pytest.MonkeyPatch, plan: dict[type, list]) -> None:
+    """Script the fake LLM per schema: each call takes the next entry, an exception to raise
+    or a result to return; an empty list means the normal fake. Every call is recorded. The
+    lists are copied, so a shared parameter list is never consumed."""
+    fake = llm.structured_call  # the autouse fake (llm_calls is requested first)
+    steps = {schema: list(entries) for schema, entries in plan.items()}
+
+    def scripted(schema: type, **kwargs: str) -> tuple[object, llm.Usage]:
+        result = fake(schema, **kwargs)
+        if steps.get(schema):
+            step = steps[schema].pop(0)
+            if isinstance(step, BaseException):
+                raise step
+            return step, result[1]
+        return result
+
+    monkeypatch.setattr(llm, "structured_call", scripted)
+
+
+def _raise(error: BaseException):  # noqa: ANN202 - a stand-in node or agent run
+    def stand_in(*args: object, **kwargs: object) -> None:
+        raise error
+    return stand_in
+
+
+DOCS_ONLY = _pr(_file("README.md", ["fix"], ["fxi"])).model_dump()
+SECRET_README = _pr(_file("README.md", [f'SECRET_KEY = "{FAKE_SECRET}"'])).model_dump()
+ARCH_LINE = "Degraded: architecture_analyst failed ({}: injected); the review continues without the architecture analysis."
+RISK_LINE = ("Degraded: risk_agent failed ({}: injected); the review continues without the risk analysis; "
+             "its usage isn't counted.")
+SYNTH_FALLBACK_LINE = "Degraded: synthesize failed ({}: injected); using the deterministic fallback review."
+FIXED_CONFIDENCE = "Confidence: 0.20 (fixed: deterministic fallback review)."
+
+
+def _steps(output: ReviewOutput) -> list[str]:
+    """The trace without its "Step N: " prefixes, after checking the numbering."""
+    assert all(line.startswith(f"Step {i}: ") for i, line in enumerate(output.reasoning_trace, start=1))
+    return [line.split(": ", 1)[1] for line in output.reasoning_trace]
+
+
+def _assert_fallback(output: ReviewOutput, steps: list[str], risk_level: str) -> None:
+    assert output.risk_level == risk_level
+    assert output.confidence == config.FALLBACK_CONFIDENCE
+    assert "Deterministic fallback review" in output.risk_reasoning
+    assert FIXED_CONFIDENCE in steps
+    assert not any(line.startswith("Model confidence") for line in steps)
+
+
+@pytest.mark.parametrize(
+    ("raw_pr", "plan", "risk_error", "degraded", "calls", "line", "not_available", "fallback", "max_confidence"),
+    [
+        pytest.param(
+            SAMPLE_RAW, {ArchitectureFindings: [llm.LLMRefusal("injected")]}, None,
+            ["architecture_analyst"], (1, 1), ARCH_LINE.format("LLMRefusal"), "Architecture analyst", None, 0.5,
+            id="architecture refuses: not retried, synthesize works without it",
+        ),
+        pytest.param(
+            SAMPLE_RAW, {ArchitectureFindings: [llm.LLMSchemaError("injected")] * 2}, None,
+            ["architecture_analyst"], (2, 1), ARCH_LINE.format("LLMSchemaError"), "Architecture analyst", None, 0.5,
+            id="architecture schema mismatch twice: retried once, then degraded",
+        ),
+        pytest.param(
+            SAMPLE_RAW, {}, GraphRecursionError("injected"),
+            ["risk_agent"], (1, 1), RISK_LINE.format("GraphRecursionError"), "Risk reviewer", None, 0.4,
+            id="risk agent hits the recursion backstop",
+        ),
+        pytest.param(
+            SAMPLE_RAW, {}, _api_error(anthropic.InternalServerError, 500),
+            ["risk_agent"], (1, 1), RISK_LINE.format("InternalServerError"), "Risk reviewer", None, 0.4,
+            id="risk agent: API error after the SDK's retries",
+        ),
+        pytest.param(
+            DOCS_ONLY, {ReviewDraft: [llm.LLMSchemaError("injected")] * 2}, None,
+            ["synthesize"], (0, 2), SYNTH_FALLBACK_LINE.format("LLMSchemaError"), None, "low", 0.2,
+            id="docs only, synthesize schema mismatch twice: fallback review",
+        ),
+        pytest.param(
+            SECRET_README, {ReviewDraft: [llm.LLMRefusal("injected")]}, None,
+            ["synthesize"], (1, 1), SYNTH_FALLBACK_LINE.format("LLMRefusal"), None, "high", 0.2,
+            id="secret in README, synthesize refuses: fallback review is high",
+        ),
+    ],
+)
+def test_degradation(
+    raw_pr: dict,
+    plan: dict[type, list],
+    risk_error: BaseException | None,
+    degraded: list[str],
+    calls: tuple[int, int],
+    line: str,
+    not_available: str | None,
+    fallback: str | None,
+    max_confidence: float,
+    monkeypatch: pytest.MonkeyPatch,
+    llm_calls: list[LLMCall],
+) -> None:
+    """One node failing after its retries degrades, and the run still ends with a valid
+    review (§9). `calls` = (architecture, synthesize) LLM calls; `not_available` = the
+    analyst the synthesizer is told is missing; `fallback` = the fallback review's level."""
+    _inject(monkeypatch, plan)
+    if risk_error is not None:
+        monkeypatch.setattr(nodes, "run_risk_agent", _raise(risk_error))
+
+    result = build_graph().invoke({"raw_pr": raw_pr})
+
+    assert result["degraded"] == degraded
+    assert result["fallback"] is (fallback is not None)
+    output = result["output"]
+    assert isinstance(output, ReviewOutput)
+    synth = [c for c in llm_calls if c.schema is ReviewDraft]
+    assert (sum(c.schema is ArchitectureFindings for c in llm_calls), len(synth)) == calls
+    steps = _steps(output)
+    assert line in steps
+    assert output.confidence <= max_confidence
+    if not_available is not None:
+        assert all(f"{not_available}: not available." in c.user for c in synth)
+    if fallback is not None:
+        _assert_fallback(output, steps, fallback)
+    if degraded == ["risk_agent"]:  # nothing was read: every must-review file is flagged
+        assert any("not inspected by the risk agent" in area for area in output.review_focus_areas)
+
+
+def test_degradation_both_analysts(monkeypatch: pytest.MonkeyPatch, llm_calls: list[LLMCall]) -> None:
+    """Both analysts fail: synthesize makes no call, and the fallback review is written (D6)."""
+    _inject(monkeypatch, {ArchitectureFindings: [llm.LLMRefusal("injected")]})
+    monkeypatch.setattr(nodes, "run_risk_agent", _raise(GraphRecursionError("injected")))
+
+    result = build_graph().invoke({"raw_pr": SAMPLE_RAW})
+
+    assert sorted(result["degraded"]) == ["architecture_analyst", "risk_agent", "synthesize"]
+    assert result["fallback"] is True
+    assert not any(c.schema is ReviewDraft for c in llm_calls)
+    output = result["output"]
+    steps = _steps(output)
+    for line in (ARCH_LINE.format("LLMRefusal"), RISK_LINE.format("GraphRecursionError"),
+                 "Synthesize: skipped, both analysts failed; using the deterministic fallback review.",
+                 "Validation skipped: no draft."):
+        assert line in steps
+    _assert_fallback(output, steps, "medium")  # the sample: a core file and a new module
+    assert output.review_focus_areas[0].startswith("src/flask/app.py: not reviewed by the model")
+
+
+def test_degradation_fallback_repaired(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The risk agent verified a high finding, then synthesize failed: the fallback review's
+    rules would say medium, and the repair raises it to the verified finding (7.11, CR1)."""
+    answer = AIMessage(json.dumps({"findings": [
+        {"file": APP, "description": "d1", "evidence": TMR, "severity": "high"},
+    ]}))
+    monkeypatch.setattr(llm, "agent_model", lambda effort: ScriptedChatModel(script=[_calls(_read(APP)), answer]))
+    _inject(monkeypatch, {ReviewDraft: [llm.LLMRefusal("injected")]})
+
+    result = build_graph().invoke({"raw_pr": SAMPLE_RAW})
+
+    assert result["degraded"] == ["synthesize"] and result["fallback"] is True
+    output = result["output"]
+    steps = _steps(output)
+    assert output.risk_level == "high" and output.confidence == config.FALLBACK_CONFIDENCE
+    assert output.risk_reasoning.startswith("[Repaired: risk level raised from 'medium' to 'high'")
+    assert "Repair: risk_level raised from 'medium' to 'high' (the highest verified risk finding)." in steps
+
+
+def test_degradation_revision_fails(monkeypatch: pytest.MonkeyPatch, llm_calls: list[LLMCall]) -> None:
+    """The revision fails: the first draft is kept and repaired, not replaced (D4)."""
+    bad = ReviewDraft(
+        risk_level="low", risk_reasoning="r", architectural_impact="a",
+        review_focus_areas=[FocusArea(file="nope.py", concern="c")], confidence=0.8, confidence_reasoning="c",
+    )
+    _inject(monkeypatch, {ReviewDraft: [bad, llm.LLMRefusal("injected")]})
+
+    result = build_graph().invoke({"raw_pr": DOCS_ONLY})
+
+    assert result["degraded"] == ["synthesize"]
+    assert result["fallback"] is False  # a model's draft, kept: the CLI doesn't call it a fallback
+    assert sum(c.schema is ReviewDraft for c in llm_calls) == 2
+    output = result["output"]
+    steps = _steps(output)
+    assert ("Degraded: synthesize failed (LLMRefusal: injected); keeping the first draft, which still fails "
+            "validation.") in steps
+    assert ("Validation still failing after 1 retry: focus area 1 names `nope.py`, which is not a file in "
+            "this PR.") in steps
+    assert any(line.startswith("Repair: ") for line in steps)
+    assert not any("nope.py" in area for area in output.review_focus_areas)
+    assert output.confidence <= 0.5 and "Deterministic fallback review" not in output.risk_reasoning
+
+
+def test_finalize_without_draft_is_a_bug(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No draft and no degraded synthesize is a wiring bug: it raises, not a quiet fallback (CR7)."""
+    monkeypatch.setattr(nodes, "synthesize", lambda state: {"reasoning_trace": ["no draft"]})
+    with pytest.raises(RuntimeError, match="without a draft"):
+        build_graph().invoke({"raw_pr": DOCS_ONLY})
+
+
+@pytest.mark.parametrize(
+    ("raw_pr", "plan", "error"),
+    [
+        pytest.param(DOCS_ONLY, {ReviewDraft: [KeyError("bug")]}, KeyError, id="a bug in synthesize"),
+        pytest.param(
+            SAMPLE_RAW, {ArchitectureFindings: [_api_error(anthropic.AuthenticationError, 401)]},
+            anthropic.AuthenticationError, id="401 in the architecture analyst: fatal",
+        ),
+        pytest.param(
+            SAMPLE_RAW, {ArchitectureFindings: [GraphRecursionError("x")]}, GraphRecursionError,
+            id="recursion error outside the risk agent: a bug",
+        ),
+    ],
+)
+def test_degradation_reraises(
+    raw_pr: dict, plan: dict[type, list], error: type[BaseException], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only degradable failures degrade; anything else fails the run with its own type (D2)."""
+    _inject(monkeypatch, plan)
+    with pytest.raises(error):
+        build_graph().invoke({"raw_pr": raw_pr})
+
+
+def test_degraded_line() -> None:
+    """The error's type and the first line of its message, cut (7.4)."""
+    then = "then."
+    assert nodes.degraded_line("synthesize", llm.LLMRefusal("injected"), then) == (
+        "Degraded: synthesize failed (LLMRefusal: injected); then."
+    )
+    long = nodes.degraded_line("x", llm.LLMError("a" * 300), then)
+    assert long == f"Degraded: x failed (LLMError: {'a' * 200}… [100 more characters]); then."
+    two = nodes.degraded_line("x", llm.LLMSchemaError("line one\ninput_value='PR TEXT'"), then)
+    assert two == "Degraded: x failed (LLMSchemaError: line one); then."
+    assert nodes.degraded_line("x", KeyError(), then) == "Degraded: x failed (KeyError); then."
+
+
+def test_graph_diagram() -> None:
+    """The handlers add one unconnected node each; the 7 nodes' edges are unchanged (7.5)."""
+    mermaid = build_graph().get_graph().draw_mermaid()
+    handler_lines = [line.strip() for line in mermaid.splitlines() if "__error_handler__" in line]
+    assert handler_lines == [
+        f"__error_handler__{name}(__error_handler__{name})"
+        for name in ("architecture_analyst", "risk_agent", "synthesize")
+    ]
+    edges = sorted(line.strip() for line in mermaid.splitlines() if "->" in line)
+    assert edges == sorted([  # HEAD's edges before Phase 7 (f5822fd)
+        "__start__ --> parse_pr;",
+        "architecture_analyst --> synthesize;",
+        "classify_pr -.-> architecture_analyst;",
+        "classify_pr -.-> risk_agent;",
+        "classify_pr -.-> synthesize;",
+        "parse_pr --> classify_pr;",
+        "risk_agent --> synthesize;",
+        "synthesize --> validate;",
+        "validate -.-> finalize;",
+        "validate -.-> synthesize;",
+        "finalize --> __end__;",
+    ])
+
+
+@pytest.fixture
+def cli_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The CLI on the fake LLM: a dummy Claude key, and no .env loading, which would put the
+    developer's real keys (Jev's too) into the test's environment."""
+    monkeypatch.setattr(cli, "load_dotenv", lambda *args, **kwargs: None)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+
+
+def _write_pr(tmp_path: Path, content: bytes | dict) -> Path:
+    path = tmp_path / "pr.json"
+    path.write_bytes(content if isinstance(content, bytes) else json.dumps(content).encode())
+    return path
+
+
+@pytest.mark.usefixtures("cli_env")
+@pytest.mark.parametrize(
+    ("failing", "degraded", "fallback"),
+    [
+        pytest.param(None, None, False, id="full review: exit 0"),
+        pytest.param(ArchitectureFindings, "architecture_analyst", False, id="degraded, model review: exit 3"),
+        pytest.param(ReviewDraft, "synthesize", True, id="fallback review: exit 3, and stderr says so"),
+    ],
+)
+def test_cli_writes_review(
+    failing: type | None,
+    degraded: str | None,
+    fallback: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    degrade = failing is not None
+    if degrade:
+        _inject(monkeypatch, {failing: [llm.LLMRefusal("injected")]})
+    out = tmp_path / "out" / "a" / "review.json"  # the folders don't exist yet
+
+    code = cli.main(["--pr", str(_write_pr(tmp_path, SAMPLE_RAW)), "--output", str(out)])
+
+    assert code == (cli.EXIT_DEGRADED if degrade else cli.EXIT_OK)
+    output = ReviewOutput.model_validate_json(out.read_text(encoding="utf-8"))
+    assert list(out.parent.iterdir()) == [out]  # no temp file left
+    err = capsys.readouterr().err
+    assert f"Review written to {out}: risk {output.risk_level}, confidence {output.confidence:.2f}" in err
+    assert (f"Degraded: {degraded}." in err) == degrade
+    assert any(f"Degraded: {degraded} failed" in line for line in output.reasoning_trace) == degrade
+    assert (cli.FALLBACK_NOTICE in err) == fallback
+    assert ("Deterministic fallback review" in output.risk_reasoning) == fallback
+
+
+@pytest.mark.usefixtures("cli_env")
+@pytest.mark.parametrize(
+    ("content", "expected"),
+    [
+        pytest.param(None, ["cannot read PR file", "No such file or directory"], id="missing file"),
+        pytest.param("dir", ["cannot read PR file", "Is a directory"], id="a directory"),
+        pytest.param("big", ["is over the size limit (10 bytes)."], id="over the size limit"),
+        pytest.param("/dev/zero", ["is over the size limit (10 bytes)."], id="a device: read up to the limit only"),
+        pytest.param(
+            b'{"pr_title": 1' + b"0" * 5000 + b"}",
+            ["is not valid JSON: Exceeds the limit (4300 digits) for integer string conversion"],
+            id="an integer over Python's digit limit",
+        ),
+        pytest.param(b"[" * 100_000, ["is not valid JSON: it's nested too deeply."], id="nested too deeply"),
+        pytest.param(b"ab\xffc", ["is not valid UTF-8 (invalid start byte at byte 2)."], id="not UTF-8"),
+        pytest.param(
+            b'{"pr_title": "x",}',
+            ["is not valid JSON: Expecting property name enclosed in double quotes (line 1, column 18)."],
+            id="invalid JSON",
+        ),
+        pytest.param(
+            {"changed_files": [{"path": ""}], "huge": "zq-input-value"},
+            ["doesn't match the expected format (5 errors):", "  pr_title: Field required",
+             "  changed_files.0.path: String should have at least 1 character",
+             "  changed_files.0.status: Field required", "  changed_files.0.lines_added: Field required",
+             "  changed_files.0.lines_removed: Field required"],
+            id="schema errors: all listed",
+        ),
+        pytest.param(
+            {"pr_title": "x", "changed_files": []},
+            ["(1 error):", "  changed_files: List should have at least 1 item after validation, not 0"],
+            id="no changed files",
+        ),
+        pytest.param(
+            [{"pr_title": "zq-input-value"}],
+            ["  (root): Input should be a valid dictionary or instance of PRInput"],
+            id="not a JSON object",
+        ),
+    ],
+)
+def test_cli_invalid_input(
+    content: bytes | dict | list | str | None,
+    expected: list[str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    llm_calls: list[LLMCall],
+) -> None:
+    """Invalid input exits 2 with a clear message, and nothing is written or sent (§9)."""
+    path = tmp_path / "pr.json"
+    if content == "dir":
+        path.mkdir()
+    elif content == "big":
+        monkeypatch.setattr(config, "MAX_INPUT_BYTES", 10)
+        _write_pr(tmp_path, SAMPLE_RAW)
+    elif content == "/dev/zero":
+        monkeypatch.setattr(config, "MAX_INPUT_BYTES", 10)
+        path = Path("/dev/zero")
+    elif isinstance(content, list):
+        path.write_text(json.dumps(content), encoding="utf-8")
+    elif content is not None:
+        _write_pr(tmp_path, content)
+    out = tmp_path / "review.json"
+
+    assert cli.main(["--pr", str(path), "--output", str(out)]) == cli.EXIT_INVALID_INPUT
+
+    err = capsys.readouterr().err
+    assert err.startswith("Error: ")
+    for fragment in expected:
+        assert fragment in err
+    assert "zq-input-value" not in err  # never an input value
+    assert not out.exists() and llm_calls == []
+
+
+def test_cli_usage_error(capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit) as exit_info:
+        cli.main([])
+    assert exit_info.value.code == cli.EXIT_INVALID_INPUT
+    assert "--pr" in capsys.readouterr().err
+
+
+@pytest.mark.usefixtures("cli_env")
+def test_cli_fatal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], llm_calls: list[LLMCall]
+) -> None:
+    """Exit 1: no key, a bug, or an unwritable output; never a half-written file (§9, D8)."""
+    pr = str(_write_pr(tmp_path, DOCS_ONLY))
+    out = tmp_path / "review.json"
+
+    # No key: nothing runs.
+    monkeypatch.setenv("ANTHROPIC_API_KEY", " ")
+    assert cli.main(["--pr", pr, "--output", str(out)]) == cli.EXIT_FATAL
+    assert "Error: ANTHROPIC_API_KEY is not set" in capsys.readouterr().err
+    assert llm_calls == [] and not out.exists()
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+
+    # A bug in a node: re-raised by nobody's handler, reported with its traceback.
+    with monkeypatch.context() as m:
+        m.setattr(nodes, "classify_pr", _raise(KeyError("bug")))
+        assert cli.main(["--pr", pr, "--output", str(out)]) == cli.EXIT_FATAL
+    err = capsys.readouterr().err
+    assert "Fatal error: KeyError: 'bug'" in err and "Traceback" in err
+    assert not out.exists()
+
+    # A long message: its first line only, cut like the trace's (CR9).
+    with monkeypatch.context() as m:
+        m.setattr(nodes, "classify_pr", _raise(RuntimeError("x" * 300 + "\nzq-second-line")))
+        assert cli.main(["--pr", pr, "--output", str(out)]) == cli.EXIT_FATAL
+    err = capsys.readouterr().err
+    assert f"Fatal error: RuntimeError: {'x' * 200}… [100 more characters]\n" in err
+
+    # The output path is a folder: the review goes to stdout instead.
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    assert cli.main(["--pr", pr, "--output", str(folder)]) == cli.EXIT_FATAL
+    captured = capsys.readouterr()
+    assert isinstance(ReviewOutput.model_validate_json(captured.out), ReviewOutput)
+    assert f"Error: cannot write '{folder}'" in captured.err
+    assert list(folder.iterdir()) == []  # the temp file was removed
+
+    # The rename fails over an existing file: it's left as it was.
+    out.write_text("previous review", encoding="utf-8")
+    with monkeypatch.context() as m:
+        m.setattr(cli.os, "replace", _raise(OSError(28, "No space left on device")))
+        assert cli.main(["--pr", pr, "--output", str(out)]) == cli.EXIT_FATAL
+    assert "No space left on device" in capsys.readouterr().err
+    assert out.read_text(encoding="utf-8") == "previous review"
+    assert list(tmp_path.glob(".review.json.*.tmp")) == []
+
+
+@pytest.mark.usefixtures("cli_env")
+def test_cli_output_permissions(tmp_path: Path) -> None:
+    """A new review gets the usual new-file permissions, and a rewrite keeps the old file's,
+    not the temp file's 0600 (CR3)."""
+    pr = str(_write_pr(tmp_path, DOCS_ONLY))
+    new, existing = tmp_path / "new.json", tmp_path / "existing.json"
+    existing.write_text("old", encoding="utf-8")
+    existing.chmod(0o640)
+    umask = os.umask(0)
+    os.umask(umask)
+
+    for out in (new, existing):
+        assert cli.main(["--pr", pr, "--output", str(out)]) == cli.EXIT_OK
+
+    assert stat.S_IMODE(new.stat().st_mode) == 0o666 & ~umask
+    assert stat.S_IMODE(existing.stat().st_mode) == 0o640
+
+
+def test_cli_loads_dotenv_from_cwd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The .env of the folder the CLI runs in is loaded, not the package's (CR6)."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "placeholder")  # recorded, so teardown restores it
+    monkeypatch.delenv("ANTHROPIC_API_KEY")
+    (tmp_path / ".env").write_text("ANTHROPIC_API_KEY=sk-from-cwd\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+
+    assert cli.main(["--pr", str(_write_pr(tmp_path, DOCS_ONLY)), "--output", "review.json"]) == cli.EXIT_OK
+    assert os.environ["ANTHROPIC_API_KEY"] == "sk-from-cwd"

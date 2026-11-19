@@ -1,7 +1,7 @@
 """Main graph state (docs/PLAN.md §6).
 
-The caller sees only GraphInput → GraphOutput; everything else is internal working memory.
-The risk agent's own state (RiskAgentState, a create_agent state schema) lives in risk_agent.py.
+The caller sees only GraphInput → GraphOutput (the review, and which stages degraded);
+everything else is internal working memory. The risk agent's own state (RiskAgentState, a create_agent state schema) lives in risk_agent.py.
 """
 
 from __future__ import annotations
@@ -39,6 +39,7 @@ class ReviewState(TypedDict):
     degraded: Annotated[list[str], operator.add]  # stages that failed or fell back
     reasoning_trace: Annotated[list[str], operator.add]
     output: ReviewOutput | None
+    fallback: bool  # finalize wrote the deterministic fallback review (§9); set by finalize
 
 
 class GraphInput(TypedDict):
@@ -47,3 +48,5 @@ class GraphInput(TypedDict):
 
 class GraphOutput(TypedDict):
     output: ReviewOutput | None
+    degraded: list[str]  # the stages that failed; the CLI exits 3 when it's non-empty (§9)
+    fallback: bool  # the review is the rule-based fallback; the CLI says so on stderr (§9)

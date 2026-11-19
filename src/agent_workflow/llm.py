@@ -13,6 +13,13 @@ Anthropic (Claude Opus 5.5) is the only provider. Behaviour verified in Phase 4.
 - the system prompt carries a cache breakpoint; it caches from 512 tokens,
 - with `include_raw=True` a parse failure is returned, not raised, so it's raised here,
 - a refusal can't parse either, so it's checked first: refusals fail fast, never retried.
+
+Error policy (§9, Phase 7, D2): `is_degradable` says which failures a node survives as a
+degraded stage: our `LLMError` family, and any API error the SDK gave up on after its own
+retries. A 401 or 403 is not: a bad key fails every call the same way, so the run stops
+(exit 1) instead of writing a review no model wrote. `langchain-anthropic` re-raises the
+SDK's errors as its own subclasses of them (checked in 7.1), so the checks use the SDK's
+classes.
 """
 
 from __future__ import annotations
@@ -21,6 +28,7 @@ import os
 from dataclasses import dataclass
 from typing import Any, Literal, TypeVar
 
+import anthropic
 from langchain.agents.middleware import AgentMiddleware
 from langchain_anthropic import ChatAnthropic
 from langchain_anthropic.middleware import AnthropicPromptCachingMiddleware
@@ -44,6 +52,19 @@ class LLMRefusal(LLMError):
 
 class LLMSchemaError(LLMError):
     """The output didn't match the schema. The node's RetryPolicy retries it once (§9)."""
+
+
+# A bad or unauthorised key: every call would fail the same way, so these are fatal (D2).
+_FATAL_PROVIDER_ERRORS = (anthropic.AuthenticationError, anthropic.PermissionDeniedError)
+
+
+def is_degradable(error: BaseException) -> bool:
+    """True if a node that raised `error` (after its retries) should degrade, not fail the
+    run: an LLMError, or an API error the SDK gave up on, except a 401/403 (D2). Anything
+    else is a bug and must surface."""
+    if isinstance(error, _FATAL_PROVIDER_ERRORS):
+        return False
+    return isinstance(error, (LLMError, anthropic.APIError))
 
 
 @dataclass(frozen=True)

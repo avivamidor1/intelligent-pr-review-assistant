@@ -24,6 +24,7 @@ The output fields are `risk_level`, `risk_reasoning`, `architectural_impact`, `r
 | langgraph | Orchestration: the main graph, conditional routing, parallel fan-out/fan-in, bounded cycles, RetryPolicy. The risk agent is itself a compiled LangGraph graph. | Yes |
 | langchain | The risk agent (§7): `create_agent`, its middleware (tool-call and model-call limits, tool errors, refusals), `ProviderStrategy` structured output, and tools defined with `@tool` + `ToolRuntime` | Yes |
 | langchain-core + langchain-anthropic | `ChatAnthropic`, message types, `with_structured_output` for the single-call nodes, and `AnthropicPromptCachingMiddleware` for the agent | Yes |
+| anthropic | The SDK's error classes, for the degradation policy (`llm.is_degradable`, §9). Already installed through `langchain-anthropic`, which re-raises the SDK's errors as subclasses of them; declared because `llm.py` imports it (Phase 7). | Yes |
 | python-dotenv | Load `.env` | Yes |
 | regex | The risk agent's `search_diff` (§7): a drop-in for `re` whose matching takes a **timeout**. The pattern is model-written and runs over untrusted PR text, so catastrophic backtracking must not hang the review. Python's `re` has no timeout and can't be interrupted, and a thread can't be killed. Added in the Phase 5 review (R2); the timeout covers matching only, so compile cost is bounded by pattern limits (5.12 review, CR1). | Yes |
 | httpx (Jev client) | Routing's decision model, Jev by TypeSafe (§3.3): one `POST /v1/systemone` to the pinned `jev-1.14.0`, with our own 3 s per-phase timeout and single retry. It's **optional**: without `JEV_API_KEY` the router uses rules only. Plain HTTP rather than the `typesafe-sdk`, whose built-in retries would be a second, unreviewed retry layer (Phase 6, D1); `httpx` was already installed through `anthropic`, and its `MockTransport` tests every failure offline. | Yes |
@@ -50,7 +51,7 @@ START → parse_pr → classify_pr ─┬─ simple ─────────�
 | `risk_agent` | **ReAct agent**, built with `create_agent` and explicit middleware (§7) | Concrete risks backed by evidence, investigated through tools |
 | `synthesize` | 1 LLM call | Simple path: review the small diff directly. Complex path: merge the analysts' findings. On a retry it also gets the validator's feedback. |
 | `validate` | Deterministic + conditional edge | Check that the draft is grounded and consistent, with at most 1 retry (a real cycle) |
-| `finalize` | Deterministic | Compute the complexity score and calibrate confidence, then assemble the output |
+| `finalize` | Deterministic | Compute the complexity score and calibrate confidence, then assemble the output. With no draft (synthesize failed or was skipped), it writes the deterministic fallback review (§9). |
 
 ### LangGraph features and why each one is used
 | Feature | Where | Why |
@@ -61,7 +62,8 @@ START → parse_pr → classify_pr ─┬─ simple ─────────�
 | Subgraph | `risk_agent` | `create_agent` returns a compiled LangGraph graph with its own state. The wrapper node invokes it, so it's testable alone and prints its own Mermaid. |
 | Reducers (`operator.add`) | `reasoning_trace`, `degraded` | Both parallel branches write to them safely |
 | `RetryPolicy` | The single-call LLM nodes | Retry when the output doesn't match the schema. Not on `risk_agent`, where a retry would re-run the whole loop; a bad final answer gets the recovery call instead (§7, §9). |
-| Input/output schemas | Graph | The caller sees `{raw_pr}` → `{output}`, and everything else stays internal |
+| Node error handlers (`error_handler`) | The 3 LLM nodes | LangGraph runs a node's handler once the node has failed after its `RetryPolicy`. A degradable failure is recorded in `degraded` and the run goes on with `Command(goto=...)` (an analyst → `synthesize`, `synthesize` → `finalize`); anything else is re-raised (§9). The Mermaid diagram shows each handler as an unconnected `__error_handler__<node>` node; the 7 nodes' edges don't change. |
+| Input/output schemas | Graph | The caller sees `{raw_pr}` → `{output, degraded, fallback}`, and everything else stays internal |
 
 **`Send` is not used.** `Send` is for a *dynamic* number of tasks decided at runtime, such as one per file. Our fan-out always has exactly two fixed branches, so static edges are the right tool.
 
@@ -299,7 +301,7 @@ class ReviewState(TypedDict):
     output: ReviewOutput | None
 ```
 
-- **Graph interface:** input `{raw_pr}`, output `{output}`. Everything else is internal working memory.
+- **Graph interface:** input `{raw_pr}`, output `{output, degraded, fallback}`: the review, the stages that failed, from which the CLI picks exit code 3, and whether `finalize` wrote the deterministic fallback review, which the CLI's stderr summary then states (§9). Neither is in the JSON file, whose schema is fixed; the fallback review says what it is in its own text. Everything else is internal working memory.
 - **Raw data and derived data are kept apart.** `ChangedFile` and `PRInput` hold only fields from the PR JSON. Unknown keys are dropped, so the input can't supply a category, priority or flag. Everything the system derives lives in `classifications`. When a path repeats, `parse_pr` merges the entries into one `ChangedFile`: the diffs are joined in order, and the first entry's status is kept. The untouched original stays in `raw_pr`.
 - **Not in the main state:**
   - the agent's message history (it lives only in the agent's own state and is discarded after the node),
@@ -497,16 +499,16 @@ Each adjustment is written to the trace.
 | Code | Meaning |
 |---|---|
 | 0 | Full review |
-| 2 | Invalid input, nothing written |
+| 2 | Invalid input (unreadable, over 20 MB, not UTF-8, not JSON, or not the expected format), nothing written |
 | 3 | **Degraded** review written |
-| 1 | Fatal error, nothing produced |
+| 1 | Fatal error: a bug, a missing or rejected `ANTHROPIC_API_KEY`, or an unwritable output path. Nothing is written; a finished review whose file can't be written is printed to stdout. |
 
 ### Input and parsing
 | Case | Handling |
 |---|---|
 | File missing, unreadable or not UTF-8 | Exit 2 with the path and reason |
-| Input over 20MB | Exit 2 |
-| Invalid JSON | Exit 2 with line and column |
+| Input over 20MB | Exit 2. At most 20 MB + 1 byte is read, so a pipe or device can't be loaded whole either. |
+| Invalid JSON | Exit 2 with line and column (also an integer over Python's 4,300-digit limit, or nesting too deep to parse) |
 | Schema errors | Exit 2, listing **all** Pydantic errors with field paths |
 | Missing optional fields (`pr_description`, `author`) | Default to empty and note it |
 | Unknown extra fields | Ignored |
@@ -539,15 +541,22 @@ A routing fallback is a **safe default, not a degradation**. The review is still
 |---|---|
 | 429, 5xx, timeout, connection error | Anthropic SDK `max_retries=3` with exponential backoff |
 | Output doesn't match the schema | Node `RetryPolicy(max_attempts=2)`, retrying only on `llm.LLMSchemaError` (the single-call nodes). `risk_agent` has no node retry: a bad final answer gets the recovery call (§7), and a recovery call that fails too degrades the node. |
-| 400 / 401 / 403 | Fail fast |
+| 400 / 404 | Not retried; the node degrades |
+| 401 / 403 | **Fatal** (exit 1): a bad key fails every call the same way, so the run stops instead of writing a review no model wrote. A missing `ANTHROPIC_API_KEY` is checked by the CLI before the run, with the same exit code. |
 | Refusal | Server-side fallback (§5), then degraded. In the agent, `ModelRefusalMiddleware` raises the error. |
 
 ### Degradation when a node fails after retries
+Each LLM node has a LangGraph error handler (§2), which runs after the node's `RetryPolicy`. It degrades the node on an `llm.LLMError` (a refusal, a schema mismatch after the retry, `max_tokens`), on an API error the SDK gave up on (except 401/403, above), and, for `risk_agent` only, on `GraphRecursionError` (its backstop, §7). Anything else is a bug and is re-raised (exit 1). The trace gets one line, with the error's type and the first line of its message, cut to 200 characters: `Degraded: risk_agent failed (GraphRecursionError: …); the review continues without the risk analysis; its usage isn't counted.`
+
 | Node | Result |
 |---|---|
 | `architecture_analyst` | `None`; synthesize works from risk findings only |
-| `risk_agent` | `None`; synthesize works from architecture findings only |
-| `synthesize` | **Deterministic fallback review:** risk level `high` on a secret scan hit, `medium` on any core, sensitive, new-module or deleted source file or an injection hit, otherwise `low`. A secret hit in a test file counts as `medium`. Focus areas = `must_review`, then the other top-priority files (up to 6), confidence 0.2, exit 3. |
+| `risk_agent` | `None`; synthesize works from architecture findings only. The calls it made are billed but not in the trace. |
+| Both analysts | `synthesize` makes no model call (its complex-path prompt has no raw diffs, so it would have nothing to cite), and the fallback review below is written |
+| `synthesize` | **Deterministic fallback review:** risk level `high` on a secret scan hit, `medium` on any core, sensitive, new-module or deleted source file or an injection hit, otherwise `low`. A secret hit in a test file counts as `medium`. Focus areas = `must_review`, then the other top-priority files (up to 6), still with the PR-wide items and the coverage marks of §3.4. Confidence is **fixed** at 0.2: not calibrated, because §8's signals discount a model's review. Its rules don't see the risk agent's findings, so it's **repaired** like any draft (§8): a verified risk finding above its level raises it, with a `[Repaired: …]` note. Exit 3. |
+| `synthesize`'s revision | The first draft is kept and repaired as after any failed retry (§8), rather than thrown away for the fallback review. Exit 3. |
+
+Any degraded node gives exit 3. A routing fallback (§3.3) is not a degradation. When the review is the deterministic fallback, the stderr summary ends with "This is a rule-based fallback review, not an AI-generated review." A kept first draft (synthesize's revision failed) is a model's review, so it doesn't.
 
 ### Untrusted input
 - **Prompt injection:**
@@ -559,7 +568,7 @@ A routing fallback is a **safe default, not a degradation**. The review is still
 
 ### Output
 - Create the parent directory if missing.
-- **Atomic write** (a temp file, then rename).
+- **Atomic write** (a temp file, then rename). The file gets an existing file's permissions, or the usual new-file ones (`0o666` minus the umask), not the temp file's `0600`. A symlink at the output path is replaced, not followed.
 - If the path is unwritable, print the JSON to stdout and exit 1.
 
 ---
@@ -596,14 +605,14 @@ A routing fallback is a **safe default, not a degradation**. The review is still
 ## 12. Langfuse (development only, not submitted)
 `observability.py` returns a `CallbackHandler` only if both keys and `LANGFUSE_BASE_URL` are set and the package is installed. The base URL must be explicit, because the SDK's default is Langfuse Cloud. The handler is passed in the graph config, giving one nested trace per run: the route decision, the analysts in parallel, the agent's tool calls and the validate loop. There are no scores or experiments. The client is created with a span filter: Langfuse's default rule minus the Anthropic SDK's own spans (scope `com.anthropic.sdk.python`), which would otherwise show every Claude call twice and double the trace's cost (Phase 5.9).
 
-The server is self-hosted locally: `langfuse/` holds Langfuse's official `docker-compose.yml` (unmodified) and a `.env.example` for its secrets, so no trace data leaves the machine. `traced_run()` wraps a run: it sets the trace name and flushes on exit, since a short-lived process would otherwise exit before the spans are sent. Until the CLI exists (Phase 7), `dev_run.py` runs the graph on a PR file with tracing.
+The server is self-hosted locally: `langfuse/` holds Langfuse's official `docker-compose.yml` (unmodified) and a `.env.example` for its secrets, so no trace data leaves the machine. `traced_run()` wraps a run: it sets the trace name and flushes on exit, since a short-lived process would otherwise exit before the spans are sent. The CLI (`cli.py`) runs every review through `traced_run`, so a run is traced whenever the keys are set; `dev_run.py`, the stand-in until the CLI existed, was removed in Phase 7.
 
 ---
 
 ## 13. File layout
 
 ```
-analyze_pr.py                    # CLI: args, exit codes, atomic write
+analyze_pr.py                    # the CLI entry point: a thin wrapper around agent_workflow.cli
 pr_input.json                    # mock PR (provided)
 code_review_output.json          # generated deliverable
 requirements.txt                 # uv export, without the dev/tracing group
@@ -611,7 +620,7 @@ README.md
 docs/PLAN.md
 src/agent_workflow/
   config.py          # models, effort per node, routing thresholds, Jev threshold, weights, budgets
-  llm.py             # the LLM boundary: provider-neutral structured_call(+_messages), Usage, LLMError family; the agent's model and provider middleware (agent_model, agent_middleware); Claude (ChatAnthropic, effort, fallbacks, caching) behind it, the only module importing the provider
+  llm.py             # the LLM boundary: provider-neutral structured_call(+_messages), Usage, LLMError family, is_degradable (§9); the agent's model and provider middleware (agent_model, agent_middleware); Claude (ChatAnthropic, effort, fallbacks, caching) behind it, the only module importing the provider
   router.py          # classify_pr: hard rules; Jev (question, bounded payload, httpx client with timeout and one retry, threshold); fallback
   schemas.py         # Pydantic models (raw input, file classification, stats, plan, route decision, Jev response, findings, draft, output)
   state.py           # ReviewState + reducers
@@ -620,13 +629,13 @@ src/agent_workflow/
   scoring.py         # deterministic post-LLM logic: complexity, confidence, draft checks (validate), fallback review
   tools.py           # 4 bounded pure tool functions (each result ≤ TOOL_RESULT_MAX_CHARS; search_diff with pattern limits and a `regex` timeout) + their @tool wrappers, RiskAgentContext (the ToolRuntime context), ToolInputError + on_error handler
   risk_agent.py      # create_agent config: RiskAgentState, middleware, budgets, wrapper, recovery call, guards
-  nodes.py           # graph nodes
-  graph.py           # build_graph(): routing, parallel analysts, cycle, RetryPolicy
+  nodes.py           # graph nodes, and the error handlers of the 3 LLM nodes (§9)
+  graph.py           # build_graph(): routing, parallel analysts, cycle, RetryPolicy, error handlers
   observability.py   # optional Langfuse handler + traced_run (dev only)
-  dev_run.py         # dev runner: graph on a PR file, traced (until the Phase 7 CLI)
+  cli.py             # the CLI: input checks (§9), the traced run, exit codes, atomic write; also the `analyze-pr` script
   project_context.md # Flask conventions + core path patterns (swappable)
 langfuse/                        # dev only: local Langfuse (official docker-compose.yml + .env.example)
-tests/test_pipeline.py           # one test module: the deterministic layer, the graph's two paths, the agent's tools, loop and guards, Jev routing (fake LLMs, a scripted agent model, a mock Jev transport), no API key and no network
+tests/test_pipeline.py           # one test module: the deterministic layer, the graph's two paths, the agent's tools, loop and guards, Jev routing, degradation and the CLI (fake LLMs, a scripted agent model, a mock Jev transport), no API key and no network
 ```
 
 ---

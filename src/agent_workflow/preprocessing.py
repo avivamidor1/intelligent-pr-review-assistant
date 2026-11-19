@@ -615,6 +615,14 @@ def cut_text(text: str, limit: int) -> str:
     return f"{text[:limit]}… [{len(text) - limit} more characters]"
 
 
+def first_line(error: BaseException, limit: int) -> str:
+    """The first line of an error's message, cut at `limit` ("" if it has none). The one rule
+    for an error shown in the trace or on stderr: later lines can quote input values (a
+    Pydantic error's), and an API error's one line carries the response body."""
+    lines = str(error).strip().splitlines()
+    return cut_text(lines[0], limit) if lines else ""
+
+
 def is_code_file(classification: FileClassification) -> bool:
     """A non-filtered source, config or test file: what `code_files` and `code_lines_changed` count."""
     return (
