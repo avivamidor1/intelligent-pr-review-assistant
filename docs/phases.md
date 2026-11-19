@@ -17,7 +17,7 @@ A phase is broken into sub-tasks before we start it, and the sub-tasks are revie
 | 4 | LLM foundation | First real run on the sample | ✅ Done |
 | 5 | ReAct risk agent (`create_agent`) | The agent loop works, stops on budget, and recovers from tool errors | ✅ Done |
 | 6 | Jev router | The uncertain middle is routed with and without `JEV_API_KEY` | ✅ Done |
-| 7 | Degradation & CLI | Simulated failures produce degraded output with exit code 3 | — |
+| 7 | Degradation & CLI | Simulated failures produce degraded output with exit code 3 | ✅ Done |
 | 8 | Langfuse tracing (dev only) | A nested trace appears in the Langfuse UI | ✅ Done (early, before Phase 4) |
 | 9 | Deliverables | `code_review_output.json`, `requirements.txt` and the README are done | — |
 
@@ -1746,9 +1746,306 @@ Each decision has a recommendation. The sub-tasks below are written as if every 
 - the `typesafe-sdk` (unless D1 changes).
 
 ## Phase 7: Degradation & CLI
-**Files:** `analyze_pr.py`, the per-node fallbacks.
-**Check:** simulated failures produce degraded output with exit code 3, and invalid input exits with 2.
-*Sub-tasks: to be written when the phase starts.*
+**Goal:** every valid input ends with a review that matches the schema (PLAN.md principle 5). An LLM node that fails after its retries is marked degraded, and the run goes on: an analyst is dropped, and a failed `synthesize` is replaced with the deterministic fallback review (§9). The CLI `analyze_pr.py` checks the input, runs the graph, writes the output atomically, and returns the §9 exit codes (0 full, 2 invalid input, 3 degraded, 1 fatal).
+**Files:** `nodes.py` (3 error handlers; `synthesize`, `validate` and `finalize` handle a missing draft), `graph.py` (handlers wired), `state.py` (`GraphOutput.degraded`, D3), `llm.py` (which errors degrade, D2), `config.py` (input limit), `src/agent_workflow/cli.py` (new) + `analyze_pr.py` (new, a shim), `pyproject.toml` (the script entry), `dev_run.py` and `__init__.main` (removed, D7), `tests/test_pipeline.py`, `docs/PLAN.md` (approved decisions only), `.env.example` (a comment).
+**Check:**
+- simulated failures in each LLM node give a degraded review that validates as `ReviewOutput`, with exit code 3,
+- both analysts failing, or `synthesize` failing, gives the deterministic fallback review (confidence 0.2),
+- invalid input exits 2 with a clear message and writes nothing,
+- a bug (an unexpected exception) or a bad API key exits 1, and isn't hidden as "degraded",
+- the output file is written atomically, and an unwritable path prints the JSON to stdout and exits 1.
+
+**Design references:** PLAN.md §1 principle 5 (always an honest output), §2 (`RetryPolicy`), §6 (graph interface), §7 (recursion backstop: "the node degrades"), §8 (confidence caps for degraded stages), §9 (exit codes, input handling, LLM failures, degradation table, output), §12 (`dev_run` until the CLI exists), §13 (file layout).
+**Conventions:** the same as in Phases 2–6.
+- Deterministic logic stays in pure functions. The handlers and the CLI are thin.
+- Trace lines are plain sentences. An error appears by its type and the first line of its message, cut to 200 characters: never a traceback, an input value or a key.
+- Tests use no API key and no network (the autouse fakes and the `no_jev` guard stay).
+
+**Already in place (checked in the code, `f5822fd`):**
+- `scoring.fallback_review(classifications, plan, stats) -> ReviewDraft` (Phase 2): the §9 levels, the focus areas, confidence `FALLBACK_CONFIDENCE` = 0.2. Not called by any node yet.
+- `confidence_signals` already reads `"architecture_analyst"` / `"risk_agent"` in `degraded`, and applies the 0.5 / 0.4 caps (`CONF_CAP_*_DEGRADED`).
+- `degraded` is an `operator.add` reducer in `ReviewState`, but **nothing writes to it yet**: today any LLM failure raises out of `invoke`.
+- `RetryPolicy(max_attempts=2, retry_on=llm.LLMSchemaError)` on `architecture_analyst` and `synthesize`; none on `risk_agent` (Phase 5, D4).
+- `PRInput` already rejects an empty `changed_files` (`min_length=1`), and `preprocess` already notes a missing `pr_description` / `author`.
+- `parse_pr` raises on a `ValidationError`, on the assumption that the CLI validates first (its docstring).
+
+**Checked before writing these sub-tasks** (offline spikes in the scratchpad, no cost, on the installed `langgraph` 1.2.19):
+- **LangGraph has a node-level `error_handler`** (`add_node(..., error_handler=fn)`, with `fn(state, error: NodeError)`; `NodeError` has `.node` and `.error`).
+  - **It runs only after the node's `RetryPolicy` is used up:** a node failing on every attempt with `max_attempts=2` ran twice, then the handler ran once.
+  - **A plain update from the handler doesn't follow the failed node's edges.** With `a ∥ b → c`, a handler returning `{"degraded": [...]}` for `b` ended the run without `c`. The handler must return `Command(update=..., goto="c")`.
+  - **With `goto`, the join behaves as we need:** one branch failing (the other slow) → `c` runs once and sees both the other branch's output and `degraded`. Both branches failing → `c` runs **once**, with `degraded == ["a", "b"]`.
+  - **A handler that re-raises `error.error` fails the run with the original exception** (a `KeyError` came out as `KeyError`), so a bug isn't swallowed.
+  - **The Mermaid diagram gains one unconnected node per handler** (`__error_handler__b`). This is visible in `uv run python -m agent_workflow.graph` (D1).
+- **Exact error values used by the tests below:**
+  - `{"changed_files": [{"path": ""}]}` gives 5 Pydantic errors: `pr_title: Field required`, `changed_files.0.path: String should have at least 1 character`, `changed_files.0.status: Field required`, `changed_files.0.lines_added: Field required`, `changed_files.0.lines_removed: Field required`.
+  - `{"pr_title": "x", "changed_files": []}` gives `changed_files: List should have at least 1 item after validation, not 0`.
+  - A JSON list gives `(root): Input should be a valid dictionary or instance of PRInput`.
+  - `{"pr_title": "x",}` gives `Expecting property name enclosed in double quotes` at line 1, column 18.
+  - `b"ab\xffc"` gives `invalid start byte` at position 2 (`0xff`).
+  - `anthropic.AuthenticationError` and `PermissionDeniedError` are `APIStatusError` → `APIError` subclasses.
+
+### Decisions needed before implementing
+Each decision has a recommendation. The sub-tasks below are written as if every recommendation is accepted.
+**Decided (yours, 2026-11-19):** D1–D9 approved as recommended, and 7.0 skipped.
+
+- **D1. How a failed node degrades.**
+  - *Recommended:* LangGraph's node-level **`error_handler`** on the 3 LLM nodes, returning `Command(goto=...)`.
+    - It runs after `RetryPolicy`, so the §2 schema retry stays exactly as it is (checked above).
+    - The node functions don't change: no `try/except` around their bodies.
+    - The handler decides what is degradable (D2) and re-raises everything else.
+    - *Cost:* the Mermaid diagram shows 3 unconnected `__error_handler__*` nodes, and PLAN.md §2 gets one row ("Error handlers: the 3 LLM nodes"). The 7 nodes and their edges don't change. The handlers are not graph steps the reviewer reasons about; they're LangGraph's recovery hooks.
+  - *Alternative A:* a `try/except` inside each node. It's plain Python, but a node that catches its own `LLMSchemaError` never lets `RetryPolicy` see it, so the schema retry would have to be hand-written in the node, and §2's `RetryPolicy` row would go.
+  - *Alternative B:* catch at `invoke()` in the CLI. That loses the other branch's work and can't continue the graph, so it can't produce a partial review.
+- **D2. Which errors degrade, and which are fatal (exit 1).**
+  - *Recommended:*
+    - **Degrade:** `llm.LLMError` and its subclasses (a refusal, a schema mismatch after the retry, `max_tokens`), any `anthropic.APIError` the SDK gave up on (429/5xx/timeout/connection after `max_retries=3`, a 400, a 404), and, for `risk_agent` only, `GraphRecursionError` (PLAN.md §7: "if it does, the node degrades").
+    - **Fatal (re-raised, exit 1):** `anthropic.AuthenticationError` (401) and `PermissionDeniedError` (403). A bad key is a setup error, and every node would fail the same way: writing a 0-LLM "review" with exit 3 would hide it. Any other exception (a `KeyError`, a `TypeError`) is a bug and is re-raised too.
+    - `llm.py` stays the only module importing the provider: it exposes `llm.is_degradable(error)`.
+  - *Alternative:* degrade on every exception. That always gives an output, but it hides bugs behind exit 3.
+- **D3. How the CLI learns the run was degraded.** The graph's output is `{output}` only, and `invoke` returns only the output schema's keys.
+  - *Recommended:* add `degraded: list[str]` to `GraphOutput` (a one-line change to PLAN.md §6's graph interface). Exit 3 ⇔ `degraded` is non-empty.
+  - *Alternative:* parse the trace for `Degraded:` lines (fragile), or add a field to `ReviewOutput` (the assignment fixes its fields).
+- **D4. `synthesize` fails on its revision** (the first draft exists and failed validation).
+  - *Recommended:* keep the **first draft** and go to `finalize`, which repairs it as today (§8 "still failing after the retry"). Record `synthesize` in `degraded` (exit 3), because an LLM stage failed (principle 5). The handler sets `revision_count + 1`, so the trace reads "after 1 retry" (the failed node's own writes are discarded).
+  - *Alternative:* the fallback review. That throws away a model-written review over one failed retry, which §8 already argues against.
+- **D5. The fallback review's confidence.**
+  - *Recommended:* fixed at **0.2** (PLAN.md §9), not passed through `calibrate_confidence`. The penalties and caps describe a model's review; the fallback has no model reasoning to discount. The trace says `Confidence: 0.20 (fixed: deterministic fallback review).` The focus areas still go through `final_focus_areas`, so the injection warning, the split-PR advice and the "not inspected" marks still apply. No repair: the fallback passes the §8 checks by construction (secret → `high`; only changed files).
+  - *Alternative:* calibrate it like any draft, which can push it to the 0.1 floor.
+- **D6. Both analysts degraded** (complex path, `architecture` and `risk` both `None`).
+  - *Recommended:* `synthesize` makes **no LLM call** (the complex-path prompt has no raw diffs, so the model would have nothing to review), writes `degraded: ["synthesize"]`, and leaves `draft = None`. `validate` with no draft skips its checks, and `finalize` writes the fallback review. No new edge.
+  - *Alternative:* call the model on the stats alone. Its review couldn't cite any evidence.
+- **D7. CLI layout and cleanup.**
+  - *Recommended:*
+    - the logic in `src/agent_workflow/cli.py` (importable and testable like every other module), and `analyze_pr.py` at the root as a 3-line shim, so the assignment's `python analyze_pr.py --pr … --output …` works (`uv run python analyze_pr.py …`),
+    - `pyproject.toml`'s `[project.scripts]` points to `agent_workflow.cli:run` as `analyze-pr` (today it points to the `uv init` "Hello" stub),
+    - delete `__init__.main` (the stub) and `dev_run.py` (PLAN.md §12: "until the CLI exists"). The CLI reuses `traced_run`, so tracing still works.
+  - *Alternative:* all the logic in the root `analyze_pr.py`. Tests would have to import a file outside the package.
+- **D8. A missing `ANTHROPIC_API_KEY`.**
+  - *Recommended:* the CLI checks it after loading `.env` and **before** building the graph: unset or blank → exit 1 with `Error: ANTHROPIC_API_KEY is not set (see .env.example).` Every path needs Claude, so a run without it can only produce a fallback review (the same reason as D2's 401).
+  - *Alternative:* let the run degrade to the fallback review (exit 3).
+- **D9. The phase check on the real API.**
+  - *Recommended:* two runs, **≈ $0.015 in total**:
+    - the CLI on the Phase 6 typo PR with `JEV_API_KEY` set (Jev → simple, one low-effort call): exit 0, the file written,
+    - the CLI on the sample with `MODEL_MAIN=claude-does-not-exist`: every Claude call gets a 404 `NotFoundError` (not billed), so both analysts degrade, `synthesize` is skipped (D6), and the fallback review is written with exit 3.
+    - plus a free one with `ANTHROPIC_API_KEY=invalid` → 401 → exit 1.
+  - The full sample run (≈ $0.25–0.40) is left for Phase 9, which produces `code_review_output.json`.
+
+### Sub-tasks
+
+- [x] **7.0 Pre-phase review (your workflow)**: *skipped (approved)*
+  - Run code-review and code-simplifier on the current code (`f5822fd`), apply the validated findings, and confirm that `uv run pytest -q` still passes.
+  - *Why skipping is recommended:* 6.10 ran both tools on the whole Phase 6 diff before the merge, and nothing has changed since (the tree is clean). This is the same reasoning as for 3.0, 5.0 and 6.0. The review runs again at 7.11, on the Phase 7 diff.
+
+- [x] **7.1 Verify-first, offline (no cost)** ✅
+  - The LangGraph `error_handler` behaviour is already checked (above). Re-check it on our real graph in 7.5's tests.
+  - Check that a 401 and a 500 from the Anthropic API surface through `ChatAnthropic.with_structured_output(...).invoke` as `anthropic.AuthenticationError` and `anthropic.InternalServerError` (not wrapped by `langchain-anthropic`). Use the real `ChatAnthropic` with a placeholder key (as `test_llm_request_payload` does), `max_retries=0`, and an `httpx.MockTransport` behind its HTTP client, so nothing is sent.
+  - Check that a `GraphRecursionError` raised inside `run_risk_agent` (a scripted model that never stops, with a tiny `recursion_limit`) leaves the node as `GraphRecursionError`.
+  - *Done when:* the three results are written here. If one differs, report it before 7.3.
+  - **Results** (a scratch script; the real `llm.structured_call` and `nodes.risk_agent`, no network):
+    - **Differs from the plan, harmlessly:** `langchain-anthropic` **does** wrap the SDK's errors, in its own subclasses that still inherit from the SDK's: a 401 came out as `AnthropicAuthenticationError(anthropic.AuthenticationError)`, a 500 as `AnthropicAPIError(anthropic.InternalServerError)`, and a 404 as `AnthropicModelNotFoundError(anthropic.NotFoundError)`. So 7.3's `isinstance` checks against the `anthropic` classes work as planned. Each made exactly 1 request (`max_retries=0`).
+    - **The messages carry the API's error body** (`Error code: 401 - {'type': 'error', 'error': {…'message': 'invalid x-api-key'}}`), not the key. 7.4 keeps the first line, cut at 200 characters.
+    - **Found:** the installed `anthropic` SDK uses **`httpx2`**, not `httpx`: passing an `httpx.Client` raises `TypeError`. A test that mocks the Anthropic API needs `httpx2.MockTransport`. (`httpx` stays the Jev client's.)
+    - **`GraphRecursionError`:** a scripted model that always calls a tool, with `recursion_limit` 4, made `nodes.risk_agent` raise `langgraph.errors.GraphRecursionError` unchanged.
+
+- [x] **7.2 `config.py`: the CLI section** ✅
+  ```python
+  MAX_INPUT_BYTES: Final = 20 * 1024 * 1024    # PLAN.md §9: input over 20 MB → exit 2
+  DEGRADED_MESSAGE_MAX_CHARS: Final = 200      # an error's message in a "Degraded:" trace line
+  ```
+  - *Done when:* each value appears once and is imported where it's used.
+  - *Result:* both are in a new "CLI and degradation (§9)" section before "Misc", each with its reason; the module docstring names the section.
+
+- [x] **7.3 `llm.py`: `is_degradable(error: BaseException) -> bool`** ✅
+  - `True` for `LLMError` (and subclasses) and for `anthropic.APIError`, **except** `anthropic.AuthenticationError` and `anthropic.PermissionDeniedError` (D2).
+  - `False` for everything else (`KeyError`, `ValueError`, `GraphRecursionError`: the agent's case is handled in its own handler, 7.4, because LangGraph isn't the provider).
+  - Update the module docstring (the error policy).
+  - *Expected values (test):* `LLMRefusal`, `LLMSchemaError`, `LLMError`, `InternalServerError`, `RateLimitError`, `APITimeoutError`, `NotFoundError` → `True`; `AuthenticationError`, `PermissionDeniedError`, `KeyError`, `GraphRecursionError` → `False`.
+  - *Result:* as planned, with a private `_FATAL_PROVIDER_ERRORS` tuple; the docstring records 7.1's finding (the subclasses). All 11 values match (`test_is_degradable`).
+    - **Not in the original file list:** `anthropic>=2.7.0` is now a **direct** dependency (`uv add`, the version already installed), because `llm.py` imports it. Same reasoning as `httpx` in Phase 6 (D1). PLAN.md §1 has the row.
+
+- [x] **7.4 `nodes.py`: the error handlers** ✅
+  ```python
+  def degraded_line(node: str, error: BaseException, then: str) -> str
+  def on_analyst_error(state: ReviewState, error: NodeError) -> Command[Literal["synthesize"]]
+  def on_synthesize_error(state: ReviewState, error: NodeError) -> Command[Literal["finalize"]]
+  ```
+  - **`degraded_line`:** `f"Degraded: {node} failed ({type(error).__name__}: {message}); {then}"`, where `message` is the first line of `str(error)`, cut with `preprocessing.cut_text` at `DEGRADED_MESSAGE_MAX_CHARS`. The first line only: a Pydantic error's later lines quote input values, which could be model or PR text.
+  - **`on_analyst_error`** (on `architecture_analyst` and `risk_agent`):
+    - not degradable → `raise error.error`. "Degradable" is `llm.is_degradable(e)`, or `isinstance(e, GraphRecursionError)` when `error.node == "risk_agent"`,
+    - `architecture_analyst` → `Command(update={"architecture": None, "degraded": ["architecture_analyst"], "reasoning_trace": [line]}, goto="synthesize")`, with `then = "the review continues without the architecture analysis."`,
+    - `risk_agent` → the same with `"risk": None, "files_inspected": [], "risk_budget_exhausted": False`, and `then = "the review continues without the risk analysis."`. The agent's spent usage is lost from the trace (its calls were billed); the line says so: `"…; its usage isn't counted."`.
+  - **`on_synthesize_error`:**
+    - not degradable → `raise error.error`,
+    - no draft in the state (the first call failed) → `Command(update={"degraded": ["synthesize"], "reasoning_trace": [line]}, goto="finalize")`, with `then = "using the deterministic fallback review."`,
+    - a draft in the state (the revision failed, D4) → also `"revision_count": state["revision_count"] + 1`, with `then = "keeping the first draft, which still fails validation."`.
+  - *Expected trace lines (test):*
+    - `Degraded: architecture_analyst failed (LLMRefusal: injected); the review continues without the architecture analysis.`
+    - `Degraded: synthesize failed (LLMSchemaError: injected); using the deterministic fallback review.`
+    - a 300-character single-line message is cut to 200 characters plus the `cut_text` marker; a two-line message keeps only line 1.
+  - *Result:* as planned, in an "Error handlers" section at the end of `nodes.py`.
+    - An error with an empty message gives `(KeyError)`, not `(KeyError: )`.
+    - LangGraph injects `NodeError` by the parameter's name (`error`) and type, and accepts the string annotation that `from __future__ import annotations` produces (checked in its source).
+    - The handler re-raises with `raise failure`, so the original type and traceback come out.
+
+- [x] **7.5 `nodes.py`: a missing draft (D5, D6) and `graph.py` / `state.py` wiring** ✅
+  - **`synthesize`:** on the complex path, when `state["architecture"] is None and state["risk"] is None` → no LLM call; return `{"degraded": ["synthesize"], "reasoning_trace": ["Synthesize: skipped, both analysts failed; using the deterministic fallback review."]}`. (On a revision this can't happen: the analysts don't re-run.)
+  - **`validate`:** `draft is None` → `{"validation_errors": [], "reasoning_trace": ["Validation skipped: no draft."]}`. `after_validate` then goes to `finalize` as it does today.
+  - **`finalize`:** replace `_require_draft` with:
+    - `draft is None` → `draft = fallback_review(classifications, plan, stats)`; skip `calibrate_confidence` and `repair_draft`; trace `Confidence: 0.20 (fixed: deterministic fallback review).`; `final_focus_areas` as today (D5). Complexity is computed as today.
+    - otherwise unchanged.
+    - `_require_draft` is removed: `validate` and `finalize` both handle a missing draft now.
+  - **`graph.py`:** `add_node(name, fn, retry_policy=..., error_handler=...)`: `nodes.on_analyst_error` for the two analysts, `nodes.on_synthesize_error` for `synthesize`. A module constant `ERROR_HANDLERS = {"architecture_analyst": ..., "risk_agent": ..., "synthesize": ...}`, looked up on `nodes` at build time like the nodes themselves (so a test can patch them). Update the docstring and the diagram comment.
+  - **`state.py`:** `GraphOutput` gets `degraded: list[str]` (D3).
+  - Update the "Phase 7" notes left in the docstrings (`nodes.py`, `risk_agent.py`, `parse_pr`).
+  - *Expected (test):* `build_graph().get_graph().draw_mermaid()` = HEAD's diagram plus exactly 3 lines declaring `__error_handler__architecture_analyst`, `__error_handler__risk_agent`, `__error_handler__synthesize`, with no new edges.
+  - *Result:*
+    - **`synthesize`'s check reads `degraded`** (both analyst names in it), not `architecture is None and risk is None`: it says why they're missing. The names are written out, because `graph.ANALYSTS` can't be imported into `nodes.py` (`graph.py` imports `nodes`).
+    - **`finalize`** builds `review` from either the draft (calibrated and repaired, as before) or the fallback review (fixed confidence), then shares the focus-area and assembly code.
+    - **The diagram, compared with HEAD's** (built from a temporary worktree): the 11 edges are identical, and the 3 handler nodes are the only added nodes. *Not predicted:* `__start__` and `__end__` lose their "first"/"last" styling (LangGraph draws the start and end nodes plainly once the graph has unconnected nodes). Cosmetic; `test_graph_diagram` checks the handlers and the edges.
+    - `GraphOutput.degraded` is `[]` on a clean run (the reducer's empty list), so the CLI never needs a default. `test_graph_paths` now checks `{output, degraded}` and `[]`.
+
+- [x] **7.6 `cli.py`: input** ✅
+  ```python
+  class InputError(Exception):
+      """The PR file can't be used. The message is shown as-is, then exit 2."""
+
+  def load_pr(path: Path) -> dict[str, Any]
+  ```
+  - Checks, in this order, each raising `InputError` with the message below (`{name}` is the path as given):
+    1. size: `path.stat().st_size > MAX_INPUT_BYTES` → `PR file '{name}' is 21.0 MB; the limit is 20 MB.` (checked before reading, so a huge file is never loaded),
+    2. read: any `OSError` (missing, a directory, no permission) → `cannot read PR file '{name}': {err.strerror}.`,
+    3. decode: strict UTF-8 → `PR file '{name}' is not valid UTF-8 (invalid start byte at byte 2).`,
+    4. JSON → `PR file '{name}' is not valid JSON: Expecting property name enclosed in double quotes (line 1, column 18).`,
+    5. schema: `PRInput.model_validate(raw)`; on `ValidationError`, one line per error, **all** of them, as `  {loc}: {msg}` with `loc` joined by `.` (`(root)` when empty) → `PR file '{name}' doesn't match the expected format (5 errors):` followed by the lines. Only `loc` and `msg`, never `input`: an input value can be a whole diff.
+  - Returns the raw dict (the graph's input); `parse_pr` validates it again, which can't fail now.
+  - Unknown fields stay ignored, and missing optional fields stay noted by `preprocess` (no CLI change).
+  - *Result:* as planned. The size and the read share one `try` (both are `OSError`s). The error count says `1 error` / `5 errors`.
+
+- [x] **7.7 `cli.py`: output** ✅
+  ```python
+  def write_output(output: ReviewOutput, path: Path) -> None   # raises OSError
+  ```
+  - `path.parent.mkdir(parents=True, exist_ok=True)`.
+  - Write `output.model_dump_json(indent=2) + "\n"` to a temp file **in the same directory** (`tempfile.NamedTemporaryFile(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp", delete=False)`), `flush` + `os.fsync`, then `os.replace(temp, path)`. Same directory, so the rename is atomic.
+  - On any `OSError`, remove the temp file if it exists, then re-raise. An existing file at `path` is never half-overwritten.
+  - *Result:* as planned.
+
+- [x] **7.8 `cli.py`: `main(argv: list[str] | None = None) -> int` and `run() -> None`** ✅
+  - Exit codes as module constants: `EXIT_OK = 0`, `EXIT_FATAL = 1`, `EXIT_INVALID_INPUT = 2`, `EXIT_DEGRADED = 3`.
+  - `argparse`: `--pr` (required) and `--output` (default `code_review_output.json`). argparse's own usage errors already exit 2, which matches "invalid input".
+  - Flow:
+    1. `load_dotenv()`,
+    2. `load_pr(args.pr)`; `InputError` → `Error: {message}` on stderr, return 2,
+    3. no `ANTHROPIC_API_KEY` (D8) → `Error: ANTHROPIC_API_KEY is not set (see .env.example).`, return 1,
+    4. `with traced_run("pr-review", metadata={"pr_file": path.name}) as config:` `result = build_graph().invoke({"raw_pr": raw}, config=config)`,
+    5. any exception from step 4 (a bug, or a fatal 401/403 per D2) → `Fatal error: {type}: {first line of message}` on stderr, plus the traceback on stderr (a fatal error is a bug or a setup error, and the traceback is what fixes it), return 1. Nothing is written,
+    6. `write_output(...)`; an `OSError` → `Error: cannot write '{output}': {strerror}; the review is printed to stdout instead.` on stderr, the JSON on stdout, return 1,
+    7. one summary line on stderr: `Review written to {output}: risk {level}, confidence {c:.2f}, complexity {s}.`, plus ` Degraded: {", ".join(degraded)}.` when degraded, plus ` This is a rule-based fallback review, not an AI-generated review.` when `result["fallback"]` (added after the phase review, at your request: `finalize` returns `fallback`, the graph output gains it, and the JSON schema is unchanged; a kept first draft is a model's review, so it gets no notice),
+    8. return 3 if `result["degraded"]` else 0.
+  - `run()` is `sys.exit(main())`, for the script entry.
+  - **`analyze_pr.py`** (root): a docstring with the usage line, then `from agent_workflow.cli import run` and `if __name__ == "__main__": run()`.
+  - **D7 cleanup:** `pyproject.toml` `[project.scripts] analyze-pr = "agent_workflow.cli:run"`; delete `__init__.main` and `dev_run.py`; `uv sync` so the entry point is reinstalled.
+  - `.env.example`: one comment that `analyze_pr.py` loads `.env`.
+  - *Result:*
+    - as planned; `load_dotenv()` runs after the arguments are parsed (a usage error needs no `.env`),
+    - **added:** `Langfuse tracing: on.` on stderr when the run was traced, which `dev_run` used to print,
+    - `langfuse/.env.example`'s "run traced" line now uses `analyze_pr.py`; the `__init__.py` stub is now a one-line docstring,
+    - `uv sync` installed the `analyze-pr` script. Checked by hand (free): `uv run python analyze_pr.py` with no arguments → argparse usage, exit 2; `uv run analyze-pr --pr <bad JSON>` → the JSON message, exit 2.
+
+- [x] **7.9 Tests (`tests/test_pipeline.py`, no network)** ✅
+  - **`test_is_degradable`**: the 7.3 values.
+  - **`test_degradation`**, parametrized; each case patches the fake LLM (or `nodes.run_risk_agent`) to raise, runs `build_graph().invoke`, and checks `degraded`, the LLM calls made, the exact `Degraded:` line and the output (it validates as `ReviewOutput`):
+
+    | Case | Injected | `degraded` | Calls | Output |
+    |---|---|---|---|---|
+    | sample, architecture refuses | `LLMRefusal` in `ArchitectureFindings` calls | `["architecture_analyst"]` | arch 1 (no retry), synthesize 1 (complex) | confidence ≤ 0.5 |
+    | sample, architecture schema × 2 | `LLMSchemaError` twice | `["architecture_analyst"]` | arch 2, synthesize 1 | confidence ≤ 0.5 |
+    | sample, risk agent recursion | `GraphRecursionError` from `run_risk_agent` | `["risk_agent"]` | arch 1, synthesize 1 | confidence ≤ 0.4; `must_review` flagged "not inspected" |
+    | sample, risk agent API error | `anthropic.InternalServerError` | `["risk_agent"]` | arch 1, synthesize 1 | confidence ≤ 0.4 |
+    | sample, both analysts fail | both of the above | `["architecture_analyst", "risk_agent", "synthesize"]` (any order) | arch 1, **synthesize 0** | fallback: risk `medium` (core file + new module), confidence 0.2, first focus area starts `src/flask/app.py: not reviewed by the model`; trace has `Validation skipped: no draft.` |
+    | docs-only, synthesize schema × 2 | `LLMSchemaError` twice in `ReviewDraft` calls | `["synthesize"]` | synthesize 2 | fallback: risk `low`, confidence 0.2 |
+    | secret in README, synthesize refuses | `LLMRefusal` | `["synthesize"]` | synthesize 1 | fallback: risk `high` |
+    | docs-only, the revision fails (D4) | the first draft names `none` (fails check 1), the second call refuses | `["synthesize"]` | synthesize 2 | the first draft, repaired: a `Repair:` line, `after 1 retry`, confidence ≤ 0.5 |
+
+  - **`test_degradation_reraises`**: a `KeyError` in `synthesize`, an `AuthenticationError` in the architecture analyst, and a `GraphRecursionError` in the architecture analyst (degradable only for the agent) each come out of `invoke` as that exception type.
+  - **Update `test_llm_retry_policy`:** the cases that raised now degrade: `LLMSchemaError` × 2 → 2 attempts and the fallback review; `LLMRefusal` and `LLMError` → 1 attempt and the fallback review. Each asserts `degraded == ["synthesize"]`.
+  - **`test_graph_diagram`**: the 7.5 Mermaid expectation.
+  - **`test_cli`**, parametrized, on `tmp_path`, calling `cli.main([...])` with `capsys`; `ANTHROPIC_API_KEY` set to a dummy (the fake LLM is used):
+
+    | Case | Exit | Checks |
+    |---|---|---|
+    | the sample | 0 | the file validates as `ReviewOutput`; no `.tmp` file left; the stderr summary line |
+    | the sample, an analyst refuses / synthesize refuses | 3 | the `Degraded:` names; the fallback notice only when synthesize failed (the fallback review) |
+    | `--output out/a/review.json` (missing folders) | 0 | the folders are created |
+    | a missing file / a directory | 2 | `cannot read PR file`; no output file |
+    | over the limit (`MAX_INPUT_BYTES` patched to 10) | 2 | `the limit is` |
+    | `b"ab\xffc"` | 2 | `not valid UTF-8 (invalid start byte at byte 2)` |
+    | `{"pr_title": "x",}` | 2 | `(line 1, column 18)` |
+    | `{"changed_files": [{"path": ""}]}` | 2 | `(5 errors)` and each of the 5 `loc: msg` lines |
+    | `{"pr_title": "x", "changed_files": []}` | 2 | `changed_files: List should have at least 1 item` |
+    | no `--pr` | 2 | argparse's `SystemExit(2)` |
+    | the sample, the architecture analyst refuses | 3 | the file is written; `Degraded: architecture_analyst` on stderr |
+    | no `ANTHROPIC_API_KEY` | 1 | no LLM call made, no file written |
+    | a `KeyError` in a node | 1 | `Fatal error: KeyError`; no file written |
+    | `--output` is an existing directory | 1 | the JSON on stdout parses as `ReviewOutput` |
+    | `os.replace` patched to raise, over an existing file | 1 | the old file is unchanged, and no `.tmp` file is left |
+
+  - **Fault injection, each caught by a test:** the handler swallowing a `KeyError`; a 401 degraded instead of fatal; the handler without `goto` (the run ends early); the fallback confidence calibrated; `synthesize` calling the model with both analysts failed; exit 0 on a degraded run; a Pydantic `input` value in the error text; a non-atomic write (writing `path` directly).
+  - *Result:*
+    - **New tests:** `test_is_degradable` (11), `test_degradation` (the 8 table rows), `test_degradation_reraises` (3), `test_degraded_line`, `test_graph_diagram`, `test_cli_writes_review` (exit 0 and 3), `test_cli_invalid_input` (8: the table's input rows plus "not a JSON object"), `test_cli_usage_error`, `test_cli_fatal` (no key, a bug, an output folder, a failed rename over an existing file).
+    - **Updated:** `test_llm_retry_policy` (the 3 failing cases now degrade to the fallback review, with the same attempt counts) and `test_graph_paths` (`{output, degraded}`).
+    - **Helpers:** `_inject` scripts the fake LLM per schema (an exception to raise or a result to return); `_api_error` builds a real SDK status error (with `httpx2`, 7.1); a `cli_env` fixture sets a dummy Claude key and **disables `load_dotenv`**, which would otherwise copy the developer's real keys (Jev's too) into the test process.
+    - **The CLI table rows are grouped by outcome** into 4 tests rather than one parametrized table; every planned row is covered. The input-error tests also check that no input value (`zq-input-value`) is printed and that no LLM call was made.
+    - **Two first failures were my test's wording,** not the code: the cut message's prefix, and the validator's real text (``focus area 1 names `nope.py`, which is not a file in this PR``).
+    - **Fault injection, 18 of 18 caught** (each mutation applied, the suite run, the file restored): the 8 planned ones, plus the synthesize handler swallowing a bug, the temp file not removed, the revision not counted (D4), the whole message in the trace, the agent's recursion not degradable, recursion degradable for any node, `validate` checking a missing draft, no key check, the size check skipped, and the handler not wired on `synthesize`.
+    - **The suite passes (150)** normally, with every key unset, and with the real `.env` keys exported. ruff (F rules) and `py_compile` are clean.
+
+- [x] **7.10 Docs** ✅
+  - **PLAN.md (approved decisions only):**
+    - §2: a "LangGraph features" row for the error handlers (the 3 LLM nodes, after `RetryPolicy`, `Command(goto=...)`), and a note under the diagram (D1),
+    - §6: the graph interface's output is `{output, degraded}` (D3),
+    - §9: the fatal 401/403 and the missing key (D2, D8); the degradation table gains "both analysts" (D6) and "synthesize's revision" (D4); the fallback's confidence is fixed (D5),
+    - §12 and §13: `dev_run.py` removed; `cli.py` added; `analyze_pr.py` is a shim (D7).
+  - The README's usage and exit-code section is written in Phase 9.
+  - *Result (PLAN.md):* §1 (the `anthropic` row), §2 (the error-handler feature row; `finalize`'s fallback), §6 (`{output, degraded}`), §9 (exit code 1's cases; 400/404 degrade and 401/403 are fatal; how the handlers decide, with the trace form; the degradation table gains "both analysts" and "`synthesize`'s revision", and the fallback's fixed confidence), §12 (the CLI traces; `dev_run.py` removed), §13 (`analyze_pr.py`, `cli.py`, `llm.py`, `nodes.py`, `graph.py`, the test line).
+
+- [x] **7.11 Final review pass and phase check** ✅ *Paid: 1 Jev call (≈ $0.00002) + 1 low-effort Claude call (≈ $0.014); the other two runs made no billed call*
+  - Run code-review (level `high`) and code-simplifier (report-only) on the Phase 7 diff. Each finding is checked against the code; you approve the list; then the fixes are applied, each with a test or a reason.
+  - `uv run pytest -q` passes with every key unset and with the real `.env` keys exported; `py_compile` and ruff (F rules) are clean; `git diff` is inspected.
+  - *Phase check on the real API (D9):*
+    - `uv run python analyze_pr.py --pr <typo PR> --output <scratch>/typo.json` → exit 0, the file validates,
+    - `MODEL_MAIN=claude-does-not-exist uv run python analyze_pr.py --pr pr_input.json --output <scratch>/degraded.json` → exit 3, the fallback review (risk `medium`, confidence 0.2), 3 `Degraded:` lines,
+    - `ANTHROPIC_API_KEY=invalid …` → exit 1, nothing written, the key not printed.
+  - Tick the sub-tasks here, and set the Phase 7 status in the overview. Report, then stop for review.
+  - **Results** (approved, 2026-11-19: CR1–CR4, CR6, CR7, CR9 and the cleanups applied; CR5 and CR10 not):
+    - **Code review (level `high`): 10 findings, each checked against the code.**
+      - **CR1, the fallback review could understate a verified risk** (reasoned from the code, and now tested). On the complex path, a verified `high` risk finding followed by a failed `synthesize` gave the fallback's rule level (`medium` on the sample), because `fallback_review` doesn't see `risk` and the fallback skipped the repair. *This was a mistake in D5* ("passes the checks by construction"). Now `finalize` runs `repair_draft` on both kinds of review: the level is raised, with a `[Repaired: …]` note, and the confidence stays 0.2. PLAN.md §9 says so.
+      - **CR2, some invalid JSON crashed instead of exiting 2** (reproduced): an integer over Python's 4,300-digit limit raises `ValueError`, and deep nesting raises `RecursionError`, neither a `JSONDecodeError`. Both are now `InputError`s.
+      - **CR3, the review was written owner-only (`0600`)** (reproduced): the temp file's mode survived the rename. The file now gets an existing file's mode, or `0o666` minus the umask. The real runs below wrote `644`. A symlinked output path is replaced, not followed (now documented, not changed).
+      - **CR4, the size limit didn't bound a pipe or device** (`/dev/zero` stats as 0 bytes). `load_pr` now reads at most `MAX_INPUT_BYTES + 1` bytes and checks the length. The message is `is over the size limit (20,971,520 bytes).`, since the real size isn't read.
+      - **CR6, an installed `analyze-pr` looked for `.env` next to the package**, not in the folder it runs in. Now `load_dotenv(find_dotenv(usecwd=True))`.
+      - **CR7, removing `_require_draft` lost the wiring-bug check.** `finalize` now raises `RuntimeError` when there's no draft and `synthesize` isn't in `degraded`, so a bug can't pass for a fallback review with exit 0.
+      - **CR8 (with S2), the analyst handler reset fields that already hold their starting values:** the failed node's writes are discarded, and `parse_pr` started them as `None`/`[]`/`False`. Removed. Both handlers now build their update the same way.
+      - **CR9 (with S1), the first-line rule was written twice**, and the CLI's `Fatal error:` line wasn't cut. One `preprocessing.first_line(error, limit)` is used by `degraded_line` and the CLI (200 characters).
+      - **CR5, not applied: "a Langfuse failure makes the run fatal".** Not reproduced: with malformed base URLs (`not a url`, `http://[::1`), both setup and flush succeed, and 8.5 showed a stopped server still exits 0.
+      - **CR10, not applied: the PR is validated twice** (`load_pr`, then `parse_pr`). This costs milliseconds, and avoiding it would change the graph's `{raw_pr}` input.
+    - **Code-simplifier (report-only): 7 suggestions, all applied.** S1 = CR9, S2 = CR8; S3 is replaced by CR1 (the repair now runs for both reviews); S4 creates the temp file before the `try`; S5 makes `_inject` copy its lists; S6 moves the "both analysts" and "revision" cases out of `test_degradation`, which now has explicit `not_available` and `fallback` columns; S7 re-wraps two docstrings.
+    - **Tests:** + `test_degradation_fallback_repaired` (CR1), `test_finalize_without_draft_is_a_bug` (CR7), `test_cli_output_permissions` (CR3), `test_cli_loads_dotenv_from_cwd` (CR6), 3 more `test_cli_invalid_input` rows (`/dev/zero`, a 5,000-digit integer, 100,000 nested `[`), and a cut `Fatal error:` line in `test_cli_fatal` (CR9). `test_degradation` is split into it plus `test_degradation_both_analysts` and `test_degradation_revision_fails`.
+    - **Fault injection, 27 of 27 caught:** the 18 from 7.9 (anchors updated for the refactor) plus 9 for the fixes (CR1; CR2 × 2; CR3 × 2; CR4; CR6; CR7; CR9).
+    - **Checks:** the suite passes (157) normally, with every key unset, and with the real `.env` keys exported; ruff (F rules) and `py_compile` are clean; the Mermaid edges are unchanged (`test_graph_diagram`).
+    - **Phase check on the real API** (Langfuse tracing on):
+      - **The typo PR** (`src/flask/debughelpers.py`, with the real keys) → **exit 0**: `Route: simple (Jev, p=0.99)`, `Jev: jev-1.14.0, 1 attempt, 1.49 s, 551 input tokens (~$0.00002).`, one synthesize call at effort `low` (1,953 in / 236 out, ≈ $0.014), risk low, confidence 0.95, complexity 1.5, file mode `644`.
+      - **The sample with `MODEL_MAIN=claude-does-not-exist`** → **exit 3**: both analysts degraded on a real 404 (`AnthropicModelNotFoundError`), `Synthesize: skipped, both analysts failed`, `Validation skipped: no draft.`, the fallback review (risk `medium`, confidence 0.20, complexity 5.5; first focus area `src/flask/app.py: not reviewed by the model (core file); review it manually (verify: not inspected by the risk agent)`). A 404 isn't billed.
+      - **The sample with `ANTHROPIC_API_KEY=invalid-key-zq`** → **exit 1**: `Fatal error: AnthropicAuthenticationError: Error code: 401 - …`, nothing written, and the key doesn't appear on stderr.
+    - **Not verified on the real API:** a real refusal, a schema mismatch after the retry, a 5xx or 429 after the SDK's retries, and a `GraphRecursionError` in the agent. All are covered offline.
+    - Nothing committed (branch `phase-7`).
+
+**Out of scope for Phase 7:**
+- the README (Phase 9), `requirements.txt` and `code_review_output.json` (Phase 9),
+- an overall run deadline or a CLI timeout flag (PLAN.md has none),
+- any extra CLI flags (`--verbose`, `--debug`, stdout output mode),
+- retrying a degraded node a second way (e.g. another model): `ModelFallbackMiddleware` is deliberately not built (§11),
+- counting a failed risk agent's spent usage (it's lost with the failed node's writes; the trace line says so).
 
 ## Phase 8: Langfuse tracing (dev only) ✅
 **Files:** `observability.py`, `dev_run.py`, `langfuse/` (`docker-compose.yml`, `.env.example`).

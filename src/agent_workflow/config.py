@@ -7,7 +7,8 @@ Every number and path pattern used by the deterministic layer is defined here, o
 Regexes that are part of a parsing or scanning algorithm (diff hunks, import lines,
 secret and injection rules) live in preprocessing.py, next to the code that uses them.
 The model, effort levels and LLM limits are in the LLM section (Phase 4), the risk
-agent's limits in their own section (Phase 5), and the Jev router's in theirs (Phase 6).
+agent's limits in their own section (Phase 5), the Jev router's in theirs (Phase 6), and
+the CLI's and degradation's in theirs (Phase 7).
 
 The values come from PLAN.md. Most are judgment calls, not measured on real PRs, and the
 comments say what each one is meant to achieve. Two ideas run through all of them:
@@ -389,6 +390,18 @@ JEV_MODEL_NAME_MAX_CHARS: Final = 60
 # List price for jev-1.14.0, $ per million input tokens; output tokens are free (checked
 # 2026-11). Used only for the cost estimate in the trace, never for billing.
 JEV_PRICE_INPUT_PER_MTOK: Final = 0.042
+
+# ---------------------------------------------------------------------------
+# CLI and degradation (§9)
+# ---------------------------------------------------------------------------
+
+# A larger PR file exits 2 before it's read. Far above any real PR JSON: a 100-file PR is a
+# few MB.
+MAX_INPUT_BYTES: Final = 20 * 1024 * 1024
+# The error message in a "Degraded: …" trace line: its first line only, cut to this length.
+# An API error's message carries the response body, so it's bounded like any other text
+# that reaches the trace.
+DEGRADED_MESSAGE_MAX_CHARS: Final = 200
 
 # ---------------------------------------------------------------------------
 # Misc

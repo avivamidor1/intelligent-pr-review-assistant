@@ -146,10 +146,10 @@ def run_risk_agent(state: ReviewState) -> RiskRun:
 
     The agent is streamed, keeping the last state: a final answer that doesn't parse raises
     out of the run, and the recovery call needs the history (Phase 5.1). Raises
-    llm.LLMRefusal on a refusal; GraphRecursionError and other errors propagate (the node
-    fails; Phase 7 degrades it). The recovery call raises LLMSchemaError if it can't parse
-    either. Callbacks (Langfuse) come from the graph's config, so the agent nests under
-    its node.
+    llm.LLMRefusal on a refusal; GraphRecursionError and other errors propagate, and the
+    node's error handler (nodes.on_analyst_error) degrades it or re-raises. The recovery
+    call raises LLMSchemaError if it can't parse either. Callbacks (Langfuse) come from the
+    graph's config, so the agent nests under its node.
     """
     max_tool_calls, max_model_calls, recursion_limit = budgets(state["plan"])
     agent = build_risk_agent(
