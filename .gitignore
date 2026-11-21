@@ -11,3 +11,6 @@ wheels/
 
 # Secrets
 .env
+
+# Generated graph diagram (python src/agent_workflow/graph.py)
+/workflow.png

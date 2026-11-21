@@ -88,4 +88,12 @@ def build_graph() -> CompiledStateGraph:
 
 
 if __name__ == "__main__":
-    print(build_graph().get_graph().draw_mermaid())
+    from pathlib import Path
+
+    graph = build_graph().get_graph()
+    image = graph.draw_mermaid_png()
+
+    output_path = Path(__file__).resolve().parents[2] / "workflow.png"
+    output_path.write_bytes(image)
+
+    print(f"Workflow diagram saved to: {output_path}")
