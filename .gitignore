@@ -12,5 +12,5 @@ wheels/
 # Secrets
 .env
 
-# Generated graph diagram (python src/agent_workflow/graph.py)
+# Generated graph diagram (uv run python -m agent_workflow.graph)
 /workflow.png

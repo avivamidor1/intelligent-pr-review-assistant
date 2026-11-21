@@ -9,10 +9,14 @@ An LLM node that still fails after its retries goes to its error handler (nodes.
 degrades it and continues the run, or re-raises (§9). The diagram shows each handler as an
 unconnected `__error_handler__<node>` node: it's reached by LangGraph, not by an edge.
 
-The caller sees {raw_pr} → {output, degraded}; everything else is internal state. There is no
-checkpointer: this is a one-shot CLI (§11). Print the diagram with:
+The caller sees {raw_pr} → {output, degraded, fallback}; everything else is internal state.
+There is no checkpointer: this is a one-shot CLI (§11). Write the diagram to workflow.png at
+the repo root (git-ignored) with:
 
     uv run python -m agent_workflow.graph
+
+It's rendered by the mermaid.ink web service (LangChain's draw_mermaid_png default), so it
+needs network access.
 """
 
 from __future__ import annotations
@@ -90,10 +94,6 @@ def build_graph() -> CompiledStateGraph:
 if __name__ == "__main__":
     from pathlib import Path
 
-    graph = build_graph().get_graph()
-    image = graph.draw_mermaid_png()
-
-    output_path = Path(__file__).resolve().parents[2] / "workflow.png"
-    output_path.write_bytes(image)
-
+    output_path = Path(__file__).resolve().parents[2] / "workflow.png"  # src/agent_workflow/ → the repo root
+    output_path.write_bytes(build_graph().get_graph().draw_mermaid_png())
     print(f"Workflow diagram saved to: {output_path}")

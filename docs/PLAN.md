@@ -630,7 +630,7 @@ src/agent_workflow/
   tools.py           # 4 bounded pure tool functions (each result ≤ TOOL_RESULT_MAX_CHARS; search_diff with pattern limits and a `regex` timeout) + their @tool wrappers, RiskAgentContext (the ToolRuntime context), ToolInputError + on_error handler
   risk_agent.py      # create_agent config: RiskAgentState, middleware, budgets, wrapper, recovery call, guards
   nodes.py           # graph nodes, and the error handlers of the 3 LLM nodes (§9)
-  graph.py           # build_graph(): routing, parallel analysts, cycle, RetryPolicy, error handlers
+  graph.py           # build_graph(): routing, parallel analysts, cycle, RetryPolicy, error handlers; `uv run python -m agent_workflow.graph` writes workflow.png via mermaid.ink (git-ignored)
   observability.py   # optional Langfuse handler + traced_run (dev only)
   cli.py             # the CLI: input checks (§9), the traced run, exit codes, atomic write; also the `analyze-pr` script
   project_context.md # Flask conventions + core path patterns (swappable)

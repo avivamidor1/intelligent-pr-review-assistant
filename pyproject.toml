@@ -1,7 +1,7 @@
 [project]
 name = "agent-workflow"
 version = "0.1.0"
-description = "Add your description here"
+description = "A LangGraph CLI that reviews a pull request given as JSON and writes a structured review."
 readme = "README.md"
 authors = [
     { name = "״avivamidor1״", email = "aviv.studies1@gmail.com" }
