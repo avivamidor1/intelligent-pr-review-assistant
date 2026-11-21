@@ -39,7 +39,7 @@ class ReviewState(TypedDict):
     degraded: Annotated[list[str], operator.add]  # stages that failed or fell back
     reasoning_trace: Annotated[list[str], operator.add]
     output: ReviewOutput | None
-    fallback: bool  # finalize wrote the deterministic fallback review (§9); set by finalize
+    fallback: bool  # finalize wrote the deterministic fallback review (§9)
 
 
 class GraphInput(TypedDict):

@@ -166,7 +166,9 @@ def _summary(output: ReviewOutput, path: Path, degraded: list[str], fallback: bo
     )
     if degraded:
         line += f" Degraded: {', '.join(degraded)}."
-    return f"{line} {FALLBACK_NOTICE}" if fallback else line
+    if fallback:
+        line += f" {FALLBACK_NOTICE}"
+    return line
 
 
 def main(argv: list[str] | None = None) -> int:
